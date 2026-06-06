@@ -1,17 +1,408 @@
-## My Project
+# NCT GenAI Gateway
 
-TODO: Fill this README out!
+> 🌏 **English**: see [README.en.md](README.en.md). 본 문서(한국어)가 정본입니다.
 
-Be sure to:
+모든 추론이 한국(Seoul) 리전에서만 발생하도록 강제하는 region-locked LLM Gateway 샘플. 연구원이 **Claude Code CLI**를 그대로 사용하면서 내부적으로는 Bedrock(Claude Sonnet/Haiku) 또는 EKS 위의 6종 오픈소스 vLLM 모델로 라우팅된다.
 
-* Change the title in this README
-* Edit your repository description on GitHub
+> **NCT(국가핵심기술)란?** 한국 「산업기술의 유출방지 및 보호에 관한 법률」이 정한 국가핵심기술. 클라우드 이용 시 데이터·접근 권한이 국외로 나가지 않도록 요구된다([근거법](https://www.law.go.kr/법령/산업기술의유출방지및보호에관한법률)). 이 샘플은 그 요건을 AWS Seoul 리전 단일 운영으로 충족하는 아키텍처를 보여준다.
 
-## Security
+> **Disclaimer — 프로덕션 용도 아님.** 본 저장소는 교육·데모 목적의 샘플 코드이며 **프로덕션 사용을 위한 것이 아닙니다**. 어떠한 보증도 없이 "있는 그대로(as is)" 제공됩니다. 배포 전 반드시 자체 보안·컴플라이언스·운영 요건에 맞춰 검토·강화·테스트하십시오. NCT(국가핵심기술) 관련 기술은 이 아키텍처가 보여주는 *지원 컨트롤(supporting controls)*을 설명한 것으로, 규제 준수에 대한 인증이나 법적 보증이 아닙니다.
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+- **Region 고정**: `ap-northeast-2` (Seoul) — 코드상 하드코딩 (NCT 요건 지원)
+- **배포 완료 스택**: 16개 (모두 `CREATE/UPDATE_COMPLETE`)
+- **서빙 중 모델**: 6종 vLLM (scale-to-zero) + 2종 Bedrock (ON_DEMAND, IN_REGION)
+- **엔드포인트**: HTTPS 443, Route53 Private Hosted Zone (`*.nct-gateway.internal`)
 
-## License
+---
 
-This library is licensed under the MIT-0 License. See the LICENSE file.
+## Architecture
 
+```
+연구원 PC (내부망, Direct Connect / Site-to-Site VPN)
+      │ HTTPS 443
+      ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  Route53 Private Hosted Zone: *.nct-gateway.internal              │
+│    • gateway.nct-gateway.internal   → SmartRouter ALB (Internal)  │
+│    • litellm.nct-gateway.internal   → LiteLLM ALB (Internal)      │
+│    • admin.nct-gateway.internal     → Admin Console ALB           │
+└───────────────────────────────────────────────────────────────────┘
+      │
+      ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  SmartRouter (ECS Fargate, ALB 443)                              │
+│    • `general` alias → prompt 분석 → coding/math/ocr/...로 재작성 │
+│    • Anthropic Messages API 호환                                 │
+└──────────────────────────────────────────────────────────────────┘
+      │ Anthropic Messages API (claude-3-5-sonnet / alias)
+      ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  LiteLLM Proxy (ECS Fargate, ALB 443)                            │
+│    • drop_params: true  (Claude-only params 제거)                 │
+│    • model_list: 6 vLLM alias + 2 Bedrock alias                  │
+│    • Bedrock fallback via Pod Identity (IAM)                     │
+└──────────────────────────────────────────────────────────────────┘
+      │
+      ├─────────────────── OpenAI API ─────────────┐
+      │                                            │
+      ▼                                            ▼
+┌─────────────────────────┐       ┌──────────────────────────┐
+│  EKS Auto Mode (v1.32)  │       │  Amazon Bedrock (Seoul)  │
+│  VPC 10.0.0.0/16 / 3 AZ │       │    • claude-3-5-sonnet   │
+│                         │       │    • claude-3-haiku      │
+│  vLLM × 6 (scale=0)     │       │    ON_DEMAND / IN_REGION │
+│    ├ coding             │       └──────────────────────────┘
+│    ├ video              │
+│    ├ ocr                │
+│    ├ math               │
+│    ├ audio              │
+│    └ longcontext        │
+│                         │
+│  Karpenter NodePools:   │
+│    cpu / gpu / neuron   │
+│                         │
+│  Model Cache:           │
+│    S3 Mountpoint CSI    │
+│    (per-alias prefix)   │
+└─────────────────────────┘
+      ▲
+      │ Warm-up / Cool-down
+      │
+┌──────────────────────────────────────────────────────────────────┐
+│  Reservation (DynamoDB + Lambda + EventBridge)                   │
+│    • reserve-fn / expire-fn                                      │
+│    • 자동 스케줄: 평일 08:30~19:30 KST                            │
+│    • Step Functions: Warmup / Cooldown                           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CDK Stacks (16개)
+
+| Stack | 역할 |
+|-------|------|
+| `NctNetworkStack` | VPC 10.0.0.0/16, 3 AZ, NAT GW, VPC Endpoints (S3/DDB/ECR/STS/SM) |
+| `NctEksStack` | EKS Auto Mode v1.32, S3 Mountpoint CSI driver, model-cache S3 bucket |
+| `NctKarpenterStack` | NodePools: cpu / gpu (amd64) / neuron |
+| `NctVllm-Coding` | Qwen3.5-27B (g5.12xlarge, 4×A10G) |
+| `NctVllm-Video` | Qwen3.5-27B (g5.12xlarge, 4×A10G, vision/video) |
+| `NctVllm-Ocr` | InternVL3-14B (g5.12xlarge, 4×A10G) |
+| `NctVllm-Math` | Gemma 4 31B (g6e.12xlarge, 4×L40S) |
+| `NctVllm-Audio` | Phi-4 Multimodal (g5.xlarge, 1×A10G) |
+| `NctVllm-Longcontext` | LLaMA 4 Scout 17B-16E (g6e.48xlarge, 8×L40S) |
+| `NctCertStack` | Self-signed wildcard cert `*.nct-gateway.internal` → ACM + Secrets Manager (CA) |
+| `NctLiteLLMStack` | LiteLLM ECS Fargate, Internal ALB 443 |
+| `NctSmartRouterStack` | SmartRouter ECS Fargate, Internal ALB 443 |
+| `NctWarmupStack` | Step Functions (Warmup / Cooldown) |
+| `NctReservationStack` | DynamoDB reservation + reserve/expire Lambda + EventBridge |
+| `NctAdminConsoleStack` | FastAPI ECS + ALB (`admin.nct-gateway.internal`) |
+| `NctDnsStack` | Route53 PHZ `nct-gateway.internal` + alias records |
+
+---
+
+## Model Matrix
+
+### vLLM (EKS Auto Mode, scale-to-zero)
+
+| Alias | 모델 | EC2 | GPU | Max Ctx | Loading Time (캐시 있음) | 주요 벤치마크 |
+|-------|------|-----|-----|---------|--------------------------|---------------|
+| `coding` | Qwen3.5-27B | g5.12xlarge | 4×A10G | 32,768 | ~8 분 | SWE-bench 72.4% / LCB v6 80.7% |
+| `video` | Qwen3.5-27B | g5.12xlarge | 4×A10G | 32,768 | ~8 분 | MMMU 85.0 (vision/video) |
+| `ocr` | InternVL3-14B | g5.12xlarge | 4×A10G | 8,192 | ~5 분 | DocVQA 94.1 / OCRBench 875 |
+| `math` | Gemma 4 31B | g6e.12xlarge | 4×L40S | 32,768 | ~6–8 분 | AIME 2026 89.2% / GPQA 84.3% |
+| `audio` | Phi-4 Multimodal | g5.xlarge | 1×A10G | 16,384 | ~5–7 분 | 통합 audio+vision |
+| `longcontext` | LLaMA 4 Scout 17B-16E | g6e.48xlarge | 8×L40S | 131,072 | **~35 분** | 128K context / MoE (17B active) |
+
+- **scale-to-zero**: `minReplicas=0` — 미사용 시 GPU 노드 해제, 다음 요청 시 Karpenter가 노드 프로비저닝 + vLLM 시작
+- **all warmup (병렬)**: LLaMA 4 Scout 기준 ~35 분 (가장 느린 모델이 결정)
+- **캐시 위치**: S3 Mountpoint (`s3://<model-cache-bucket>/<servingName>/`)
+- **LLaMA 4 Scout 특이사항**: `--enforce-eager` 필수 (CUDA graph capture 비활성화, 부팅 20분 초과 방지)
+
+### 성능은 얼마나 떨어지는가 — frontier 대비 위치 (2026-06 검증)
+
+> 데이터 주권 요건 때문에 frontier proprietary 모델(Claude Opus, GPT 등)을 직접 못 쓰고 self-host open-weight로 대체할 때, **얼마나 성능을 양보하는지**를 먼저 알고 도입을 결정해야 한다.
+
+현행 `coding` alias의 **Qwen3.5-27B**를 frontier 상한과 비교하면 (정규화 = `max(GPT-5.5, Claude Opus 4.8)`를 100으로):
+
+| 축 | Qwen3.5-27B | frontier 상한 | **frontier 대비** |
+|----|-------------|---------------|-------------------|
+| 코딩 (SWE-bench Verified) | 72.4 | 88.6 (Opus 4.8) | **≈ 82%** |
+| 지식 (GPQA Diamond) | 85.5 | 93.6 | ≈ 91% |
+| 수학 (AIME 2026) | 90.8 | ~96.7 | ≈ 94% |
+| 코드 생성 (LiveCodeBench v6) | 80.7 | ~88 | ≈ 92% |
+
+- **헤드라인: 가장 까다로운 축인 agentic 코딩(SWE-bench)에서 frontier의 ≈ 82% 수준.** 지식·수학으로 갈수록 격차가 줄어 90% 이상으로 근접한다. 남는 갭은 "가장 어려운 agentic 코딩"에 집중된다.
+- **더 높은 충실도가 필요하면** 동일 Qwen3.5 패밀리(전부 Apache-2.0, self-host 가능)의 플래그십 **Qwen3.5-397B-A17B**(403B MoE / 17B active)로 `coding` alias를 교체할 수 있다 — SWE-bench **76.4** (frontier의 ≈ 86%), 지식·수학은 94–99%. 단 H200(P5en) 다수가 필요해 비용이 크게 증가한다.
+- ⚠️ **수치 해석 주의**: SWE-bench는 harness·vendor마다 ±3~5점 편차가 있고, 위 Qwen 수치는 모델카드의 peak reasoning mode 기준이라 실서비스 기본 설정에선 더 낮을 수 있다. **도입 전 실제 워크로드로 PoC 실측**을 권장한다.
+- 출처: Qwen 공식 HF 모델카드(`Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-397B-A17B`) + vals.ai(SWE-bench) · llm-stats(GPQA) · Artificial Analysis 교차검증.
+
+### Bedrock (ON_DEMAND / IN_REGION Seoul)
+
+| Alias | Bedrock Model ID | 용도 |
+|-------|------------------|------|
+| `claude-3-5-sonnet-20241022` | `anthropic.claude-3-5-sonnet-20240620-v1:0` | Claude Code CLI 기본 target |
+| `claude-3-haiku-20240307` | `anthropic.claude-3-haiku-20240307-v1:0` | 빠른/저비용 처리 (⚠️ 모델 EOL 일정은 Bedrock 콘솔에서 확인하고, 후속 모델로 alias를 갱신할 것) |
+
+> **"OpenAI 계열"이 필요한 경우**: proprietary GPT(예: gpt-5.x)는 가중치가 비공개라 self-host가 불가능하다. 반면 open-weight **gpt-oss-20b / gpt-oss-120b**는 vLLM alias로 추가해 Seoul in-region으로 운영할 수 있다. Bedrock 경유 경로는 서울 in-region 제공 여부를 콘솔에서 확인 후 사용한다.
+
+---
+
+## Endpoints
+
+| 용도 | URL | 백엔드 |
+|------|-----|--------|
+| 통합 진입점 (권장, Anthropic 호환) | `https://gateway.nct-gateway.internal` | SmartRouter → LiteLLM |
+| LiteLLM 직접 (OpenAI API) | `https://litellm.nct-gateway.internal/v1/chat/completions` | LiteLLM |
+| Admin Console (운영자 전용) | `https://admin.nct-gateway.internal` | FastAPI |
+
+모두 **Internal ALB + ACM(self-signed CA) + HTTPS 443**. Direct Connect / Site-to-Site VPN 필요.
+
+---
+
+## Researcher Onboarding
+
+### 최초 1회 세팅
+
+1. **CA 인증서 설치** — Secrets Manager에서 CA cert 받아 시스템 trust store에 등록
+   ```bash
+   aws secretsmanager get-secret-value \
+     --secret-id /nct/gateway/ca-cert \
+     --query SecretString --output text \
+     --region ap-northeast-2 > nct-gateway-ca.crt
+   # macOS
+   sudo security add-trusted-cert -d -r trustRoot \
+     -k /Library/Keychains/System.keychain nct-gateway-ca.crt
+   ```
+
+2. **API 키 발급 요청** — Gateway 운영자에게 요청. 현재는 단일 공유 마스터 키.
+
+3. **Claude Code CLI 설정**
+   ```bash
+   export ANTHROPIC_BASE_URL=https://gateway.nct-gateway.internal
+   export ANTHROPIC_API_KEY=<발급받은-토큰>
+   claude -p "Hello"   # → Bedrock Sonnet Seoul으로 라우팅
+   ```
+
+### Alias 사용
+
+```bash
+# general: SmartRouter가 prompt 분석 후 최적 모델 선택
+curl https://gateway.nct-gateway.internal/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"general","max_tokens":256,"messages":[...]}'
+
+# 특정 alias 강제
+curl https://litellm.nct-gateway.internal/v1/chat/completions \
+  -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
+  -d '{"model":"coding","messages":[...]}'
+```
+
+---
+
+## Warm-up / Reservation
+
+vLLM 모델은 미사용 시 `scale-to-zero` 상태. 첫 요청 시 5~35분 콜드 스타트가 발생한다. 사전에 warm-up 하려면:
+
+```bash
+# 특정 alias 1시간 warm-up
+scripts/warmup-request.sh --alias coding --requester andrew
+
+# 복수 alias + 기간
+scripts/warmup-request.sh --alias coding,math --duration 2h --requester andrew
+
+# 전체 모델 30분
+scripts/warmup-request.sh --alias all --duration 30m
+```
+
+- 예약은 DynamoDB `NctWarmupReservations`에 저장 → `reserve-fn`이 Warmup SFN 트리거
+- 만료 시 `expire-fn`이 Cooldown SFN 트리거 (겹치는 예약 있으면 연장)
+- **자동 스케줄**: 평일 08:30~19:30 KST, EventBridge rule로 모든 alias 자동 warm-up
+- **Admin Console**: `https://admin.nct-gateway.internal` — 현재 예약/상태 확인 및 수동 조작
+
+---
+
+## Admin Console
+
+- URL: `https://admin.nct-gateway.internal` (내부망)
+- 인증: Basic Auth — 비밀번호는 Secrets Manager `/nct/admin-console/password`
+- 기능:
+  - 현재 alias별 replicas / 노드 상태
+  - Active reservations 목록 / 남은 시간
+  - 수동 warm-up / cool-down
+  - LiteLLM 로그 / Bedrock 호출 통계 (기본)
+
+---
+
+## NCT 요건 지원 체크리스트
+
+> ⚠️ 아래 기술 통제는 NCT 요건을 **지원**하는 것이지, 이 코드를 배포한다고 자동으로 규정을 "준수"하게 되는 것은 아니다. 실제 NCT 컴플라이언스는 조직의 정책·인력 접근통제·감사·법적 검토를 포함한 종합 판단이며, 반드시 자체 보안/법무 검토를 거쳐야 한다.
+
+| 요건 | 지원하는 기술 통제 |
+|------|--------------------|
+| 모든 추론 Seoul 리전 | `bin/nct-genai-gateway.ts` — region 하드코딩 |
+| Bedrock IN_REGION only | `config/models.ts` BEDROCK_MODELS 전부 `ap-northeast-2` |
+| Bedrock ON_DEMAND only | Provisioned Throughput / Cross-region Inference 미사용 |
+| 연구원 네트워크 격리 | Internal ALB + Route53 PHZ, public endpoint 없음 |
+| 데이터 in transit 암호화 | ACM + HTTPS 443 (self-signed wildcard cert) |
+| 모델 가중치 격리 | S3 bucket 서울 리전, prefix per alias, 노드 IAM scope |
+| AWS API egress | VPC Endpoints (S3/DDB/ECR/STS/SM) — NAT 우회 |
+
+> **왜 Cross-Region Inference(CRIS)를 쓰지 않는가?** Bedrock에서 frontier 모델을 Seoul에서 호출하더라도, 그 모델이 in-region이 아니라 CRIS(geographic inference profile)로만 제공되면 추론 중 input prompt와 output이 같은 geography(예: APAC) 내 타 리전으로 전송된다 — 저장은 source 리전에만 남지만 **처리는 Seoul을 벗어난다** ([AWS 문서](https://docs.aws.amazon.com/bedrock/latest/userguide/geographic-cross-region-inference.html): *"your input prompts and output results might move outside of your source Region during cross-Region inference"*). 데이터의 국내 체류가 요건인 환경에서는 부적합하다. 본 게이트웨이는 (1) Seoul **IN_REGION on-demand** Bedrock 모델만 사용하고, (2) 그 외에는 EKS 위 **self-host vLLM**으로 라우팅하여 추론이 Seoul을 벗어나지 않도록 강제한다.
+
+---
+
+## Deployment
+
+### Prerequisites
+- AWS CLI configured (`ap-northeast-2` credentials)
+- Node.js >= 18, `npm install -g aws-cdk`
+- CDK Bootstrap in `ap-northeast-2`
+
+### Deploy
+
+```bash
+npm install
+AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
+# 전체 배포 ~60-90분 (EKS Auto Mode + 16 스택)
+```
+
+배포 후 alias별 vLLM NLB DNS를 `cdk.json` context의 `vllmEndpoints`에 기록 → `cdk deploy NctLiteLLMStack` 한 번 더 실행.
+
+> **운영자 주의**: `cdk.json`의 `operatorRoleArns`·`vllmEndpoints`는 비어 있는 상태로 배포된다. break-glass kubectl용 role ARN은 `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'`로 넘기거나(또는 본인 `cdk.json`에 지정), 빈 값이면 코드가 그대로 처리한다.
+
+### 단계별 배포 (권장)
+
+```bash
+# Phase 0: 네트워크 + EKS + Karpenter
+cdk deploy NctNetworkStack NctEksStack NctKarpenterStack
+
+# Phase 1-6: 모델별 vLLM (선택적)
+cdk deploy NctVllm-Coding
+# (연구원 피드백 후 나머지 추가)
+
+# Phase 7-10: 인증서 + LiteLLM + SmartRouter + Warmup + Reservation + Admin + DNS
+cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
+           NctWarmupStack NctReservationStack NctAdminConsoleStack NctDnsStack
+```
+
+---
+
+## Key Design Decisions
+
+### EKS Auto Mode v1.32
+- `aws-cdk-lib/aws-eks-v2` 사용 (Auto Mode 지원)
+- NodePool 중 `system`, `general-purpose`만 활성, GPU는 Karpenter가 프로비저닝
+- EBS CSI provisioner: `ebs.csi.eks.amazonaws.com` (Auto Mode 전용)
+
+### 모델 캐시: S3 Mountpoint (EFS 대체)
+- EKS Auto Mode + EFS CSI v3.x + Bottlerocket 조합에서 `amazon-efs-mount-watchdog` init system 미감지로 TLS 기반 NFS mount 실패 (I1)
+- S3 Mountpoint CSI (`aws-mountpoint-s3-csi-driver`)로 우회 — alias별 prefix로 격리, 노드 IAM 권한 스코핑
+- 재부팅/노드 교체 후에도 가중치 캐시 영속화
+
+### Scale-to-zero + Warm-up
+- `minReplicas=0` 기본값 → GPU 비용 상시 지출 없음
+- Karpenter ExistNow/ProvisionUnderThreshold 이벤트로 노드 생성, vLLM init에 5~35분 소요
+- Warm-up은 Step Functions로 오케스트레이션 (I7 수정: 최대 50분 timeout)
+
+### Smart Routing
+- `general` alias 요청 시 prompt embedding 분석 → scenario 감지 → `coding`/`math`/... 모델로 재작성
+- LiteLLM 직접 호출 시 scenario alias 직접 지정 가능
+
+### LiteLLM `drop_params: true`
+- Claude Code는 `thinking`, `betas`, `anthropic_version` 등 Anthropic 전용 파라미터 전송
+- vLLM은 이해 못하므로 LiteLLM이 silent strip 후 OpenAI 엔드포인트로 forwarding
+
+### Pod Identity > IRSA
+- Bedrock 호출, S3 Mountpoint 모두 EKS Pod Identity 사용
+- S3 Mountpoint CSI는 OIDC 기반 IRSA 경로도 함께 구성
+
+---
+
+## Cost Model
+
+### scale-to-zero (상시)
+| 컴포넌트 | 인스턴스 | 시간당 |
+|----------|----------|--------|
+| EKS Control Plane | — | $0.10 |
+| Karpenter system nodes | m5.large | ~$0.10 |
+| LiteLLM / SmartRouter / Admin ECS | Fargate (0.5 vCPU × 3) | ~$0.10 |
+| ALB × 3 (Internal) | — | ~$0.07 |
+| NAT GW | — | ~$0.05 |
+| S3 Storage (모델 캐시) | ~500 GB | ~$0.02 |
+| **상시 합계** | | **~$0.45/hr (~$324/month)** |
+
+### vLLM 모델 기동 시 (alias 별)
+| Alias | 인스턴스 | 시간당 추가 |
+|-------|----------|-------------|
+| coding / video / ocr | g5.12xlarge | ~$5.67 |
+| math | g6e.12xlarge | ~$3.90 |
+| audio | g5.xlarge | ~$1.00 |
+| longcontext | g6e.48xlarge | ~$30.90 |
+
+자동 스케줄(평일 08:30~19:30 KST, 11h × 21일) 기준 전체 warm-up 시 월 비용:
+- coding + video + ocr + math + audio: ~$17/hr × 231h = ~$3,927
+- + longcontext (필요 시만): +$30.90/hr × 사용시간
+
+> 비용 최적화: `longcontext`는 예약(`--alias longcontext`)으로만 기동. 필요 없는 alias는 `minReplicas=0` 유지.
+
+---
+
+## Operations
+
+### 수동 스케일
+```bash
+# alias 즉시 기동 (Warmup SFN 우회)
+kubectl scale deployment <servingName> -n vllm --replicas=1
+
+# alias 즉시 해제
+kubectl scale deployment <servingName> -n vllm --replicas=0
+```
+
+### 로그
+- vLLM: `kubectl logs deploy/<servingName> -n vllm -f`
+- LiteLLM: CloudWatch Logs `/ecs/nct-litellm`
+- SmartRouter: CloudWatch Logs `/ecs/nct-smart-router`
+- Admin Console: CloudWatch Logs `/ecs/nct-admin-console`
+- Warmup SFN: Step Functions console `NctWarmup`/`NctCooldown`
+
+### 헬스 체크
+```bash
+# LiteLLM (인증 없이 호출 가능)
+curl https://litellm.nct-gateway.internal/health/liveliness   # → "I'm alive!"
+
+# SmartRouter
+curl https://gateway.nct-gateway.internal/health
+```
+
+---
+
+## Known Issues
+
+| # | 이슈 | 상태 |
+|---|------|------|
+| I1 | Bottlerocket + EFS TLS mount 실패 | S3 Mountpoint로 우회 (운영 안정) |
+| I8 | 연구원별 독립 API 키 미지원 | 단일 공유 마스터 키. 향후 LiteLLM virtual keys로 분리 예정 |
+| — | Bedrock 모델 EOL | Seoul IN_REGION 후속 모델로 alias 갱신 필요. EOL 일정은 Bedrock 콘솔에서 확인 |
+
+---
+
+## Cleanup
+
+```bash
+cdk destroy --all --force
+```
+
+- EKS Auto Mode 삭제 ~15분
+- S3 model-cache bucket은 RETAIN 정책 (가중치 보존)
+
+---
+
+## Related
+
+- [vLLM 문서](https://docs.vllm.ai)
+- [LiteLLM 문서](https://docs.litellm.ai)
+- [Amazon EKS Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/automode.html)
+- [Claude Code — LLM Gateway 설정](https://code.claude.com/docs/en/llm-gateway)
+- [NCT 근거법 (산업기술의 유출방지 및 보호에 관한 법률)](https://www.law.go.kr/법령/산업기술의유출방지및보호에관한법률)

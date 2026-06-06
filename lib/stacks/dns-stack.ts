@@ -1,0 +1,79 @@
+import * as cdk from 'aws-cdk-lib/core';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53_targets from 'aws-cdk-lib/aws-route53-targets';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import { Construct } from 'constructs';
+
+export interface DnsStackProps extends cdk.StackProps {
+  vpc: ec2.Vpc;
+  /** e.g. 'nct-gateway.internal' */
+  zoneName: string;
+  /** ALB for gateway.{zoneName} → Smart Router (preferred entry point) */
+  smartRouterAlb: elbv2.IApplicationLoadBalancer;
+  /** ALB for litellm.{zoneName} → LiteLLM (direct access) */
+  litellmAlb: elbv2.IApplicationLoadBalancer;
+  /** ALB for admin.{zoneName} → Admin Console */
+  adminAlb?: elbv2.IApplicationLoadBalancer;
+}
+
+export class DnsStack extends cdk.Stack {
+  /** e.g. 'https://gateway.nct-gateway.internal' */
+  public readonly gatewayUrl: string;
+  /** e.g. 'https://litellm.nct-gateway.internal' */
+  public readonly litellmUrl: string;
+
+  constructor(scope: Construct, id: string, props: DnsStackProps) {
+    super(scope, id, props);
+
+    const zone = new route53.PrivateHostedZone(this, 'Zone', {
+      zoneName: props.zoneName,
+      vpc: props.vpc,
+      comment: 'NCT GenAI Gateway — private DNS for researcher PCs',
+    });
+
+    // gateway.nct-gateway.internal → Smart Router ALB (port 443)
+    new route53.ARecord(this, 'GatewayRecord', {
+      zone,
+      recordName: 'gateway',
+      target: route53.RecordTarget.fromAlias(
+        new route53_targets.LoadBalancerTarget(props.smartRouterAlb),
+      ),
+    });
+
+    // litellm.nct-gateway.internal → LiteLLM ALB (port 443, direct access)
+    new route53.ARecord(this, 'LitellmRecord', {
+      zone,
+      recordName: 'litellm',
+      target: route53.RecordTarget.fromAlias(
+        new route53_targets.LoadBalancerTarget(props.litellmAlb),
+      ),
+    });
+
+    if (props.adminAlb) {
+      new route53.ARecord(this, 'AdminRecord', {
+        zone,
+        recordName: 'admin',
+        target: route53.RecordTarget.fromAlias(
+          new route53_targets.LoadBalancerTarget(props.adminAlb),
+        ),
+      });
+    }
+
+    this.gatewayUrl = `https://gateway.${props.zoneName}`;
+    this.litellmUrl = `https://litellm.${props.zoneName}`;
+
+    new cdk.CfnOutput(this, 'GatewayUrl', {
+      value: this.gatewayUrl,
+      description: 'Set as ANTHROPIC_BASE_URL in Claude Code (routes via Smart Router)',
+    });
+    new cdk.CfnOutput(this, 'LiteLLMUrl', {
+      value: this.litellmUrl,
+      description: 'Direct LiteLLM access (bypass Smart Router)',
+    });
+    new cdk.CfnOutput(this, 'AdminUrl', {
+      value: `https://admin.${props.zoneName}`,
+      description: 'Admin Console (VPN 필요)',
+    });
+  }
+}
