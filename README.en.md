@@ -39,64 +39,16 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 
 ## Architecture
 
-```
-Researcher PC (internal network, Direct Connect / Site-to-Site VPN)
-      │ HTTPS 443
-      ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  Route53 Private Hosted Zone: *.nct-gateway.internal              │
-│    • gateway.nct-gateway.internal   → SmartRouter ALB (Internal)  │
-│    • litellm.nct-gateway.internal   → LiteLLM ALB (Internal)      │
-│    • admin.nct-gateway.internal     → Admin Console ALB           │
-└───────────────────────────────────────────────────────────────────┘
-      │
-      ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  SmartRouter (ECS Fargate, ALB 443)                              │
-│    • `general` alias → analyze prompt → rewrite to coding/math/.. │
-│    • Anthropic Messages API compatible                           │
-└──────────────────────────────────────────────────────────────────┘
-      │ Anthropic Messages API (claude-3-5-sonnet / alias)
-      ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  LiteLLM Proxy (ECS Fargate, ALB 443)                            │
-│    • drop_params: true  (strips Claude-only params)              │
-│    • model_list: 6 vLLM alias + 2 Bedrock alias                  │
-│    • Bedrock fallback via Pod Identity (IAM)                     │
-└──────────────────────────────────────────────────────────────────┘
-      │
-      ├─────────────────── OpenAI API ─────────────┐
-      │                                            │
-      ▼                                            ▼
-┌─────────────────────────┐       ┌──────────────────────────┐
-│  EKS Auto Mode (v1.32)  │       │  Amazon Bedrock (Seoul)  │
-│  VPC 10.0.0.0/16 / 3 AZ │       │    • claude-3-5-sonnet   │
-│                         │       │    • claude-3-haiku      │
-│  vLLM × 6 (scale=0)     │       │    ON_DEMAND / IN_REGION │
-│    ├ coding             │       └──────────────────────────┘
-│    ├ video              │
-│    ├ ocr                │
-│    ├ math               │
-│    ├ audio              │
-│    └ longcontext        │
-│                         │
-│  Karpenter NodePools:   │
-│    cpu / gpu / neuron   │
-│                         │
-│  Model Cache:           │
-│    S3 Mountpoint CSI    │
-│    (per-alias prefix)   │
-└─────────────────────────┘
-      ▲
-      │ Warm-up / Cool-down
-      │
-┌──────────────────────────────────────────────────────────────────┐
-│  Reservation (DynamoDB + Lambda + EventBridge)                   │
-│    • reserve-fn / expire-fn                                      │
-│    • Auto schedule: weekdays 08:30–19:30 KST                     │
-│    • Step Functions: Warmup / Cooldown                           │
-└──────────────────────────────────────────────────────────────────┘
-```
+![NCT GenAI Gateway architecture](docs/architecture/nct-architecture.png)
+
+A researcher PC on the internal network reaches the gateway over Direct Connect / Site-to-Site VPN (HTTPS 443) →
+Route 53 Private Hosted Zone (`*.nct-gateway.internal`) → SmartRouter (ECS Fargate; analyzes and rewrites the prompt, Anthropic Messages API compatible) →
+LiteLLM Proxy (ECS Fargate; 6 vLLM + 2 Bedrock aliases) →
+either **EKS Auto Mode** (vLLM × 6, scale-to-zero, Karpenter cpu/gpu/neuron, model cache on S3 Mountpoint CSI)
+or **Amazon Bedrock** (Seoul in-region fallback). A Reservation subsystem (EventBridge + Lambda + DynamoDB + Step Functions)
+drives vLLM warmup/cooldown on a weekday 08:30–19:30 KST schedule. The entire path stays within a single region (Seoul).
+
+> Editable source: [`docs/architecture/nct-architecture.drawio`](docs/architecture/nct-architecture.drawio) (draw.io)
 
 ---
 

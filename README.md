@@ -39,64 +39,16 @@
 
 ## Architecture
 
-```
-연구원 PC (내부망, Direct Connect / Site-to-Site VPN)
-      │ HTTPS 443
-      ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  Route53 Private Hosted Zone: *.nct-gateway.internal              │
-│    • gateway.nct-gateway.internal   → SmartRouter ALB (Internal)  │
-│    • litellm.nct-gateway.internal   → LiteLLM ALB (Internal)      │
-│    • admin.nct-gateway.internal     → Admin Console ALB           │
-└───────────────────────────────────────────────────────────────────┘
-      │
-      ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  SmartRouter (ECS Fargate, ALB 443)                              │
-│    • `general` alias → prompt 분석 → coding/math/ocr/...로 재작성 │
-│    • Anthropic Messages API 호환                                 │
-└──────────────────────────────────────────────────────────────────┘
-      │ Anthropic Messages API (claude-3-5-sonnet / alias)
-      ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  LiteLLM Proxy (ECS Fargate, ALB 443)                            │
-│    • drop_params: true  (Claude-only params 제거)                 │
-│    • model_list: 6 vLLM alias + 2 Bedrock alias                  │
-│    • Bedrock fallback via Pod Identity (IAM)                     │
-└──────────────────────────────────────────────────────────────────┘
-      │
-      ├─────────────────── OpenAI API ─────────────┐
-      │                                            │
-      ▼                                            ▼
-┌─────────────────────────┐       ┌──────────────────────────┐
-│  EKS Auto Mode (v1.32)  │       │  Amazon Bedrock (Seoul)  │
-│  VPC 10.0.0.0/16 / 3 AZ │       │    • claude-3-5-sonnet   │
-│                         │       │    • claude-3-haiku      │
-│  vLLM × 6 (scale=0)     │       │    ON_DEMAND / IN_REGION │
-│    ├ coding             │       └──────────────────────────┘
-│    ├ video              │
-│    ├ ocr                │
-│    ├ math               │
-│    ├ audio              │
-│    └ longcontext        │
-│                         │
-│  Karpenter NodePools:   │
-│    cpu / gpu / neuron   │
-│                         │
-│  Model Cache:           │
-│    S3 Mountpoint CSI    │
-│    (per-alias prefix)   │
-└─────────────────────────┘
-      ▲
-      │ Warm-up / Cool-down
-      │
-┌──────────────────────────────────────────────────────────────────┐
-│  Reservation (DynamoDB + Lambda + EventBridge)                   │
-│    • reserve-fn / expire-fn                                      │
-│    • 자동 스케줄: 평일 08:30~19:30 KST                            │
-│    • Step Functions: Warmup / Cooldown                           │
-└──────────────────────────────────────────────────────────────────┘
-```
+![NCT GenAI Gateway architecture](docs/architecture/nct-architecture.png)
+
+연구원 PC(내부망)에서 Direct Connect / Site-to-Site VPN으로 HTTPS 443 요청 →
+Route 53 Private Hosted Zone(`*.nct-gateway.internal`) → SmartRouter(ECS Fargate, prompt 분석·재작성, Anthropic Messages API 호환) →
+LiteLLM Proxy(ECS Fargate, 6 vLLM + 2 Bedrock alias) →
+**EKS Auto Mode**(vLLM × 6, scale-to-zero, Karpenter cpu/gpu/neuron, S3 Mountpoint CSI 모델 캐시) 또는
+**Amazon Bedrock**(Seoul in-region fallback). Reservation(EventBridge + Lambda + DynamoDB + Step Functions)이
+평일 08:30–19:30 KST 스케줄로 vLLM warmup/cooldown을 제어한다. 전 구간이 단일 리전(Seoul) 안에서 동작한다.
+
+> 편집 가능한 원본: [`docs/architecture/nct-architecture.drawio`](docs/architecture/nct-architecture.drawio) (draw.io)
 
 ---
 
