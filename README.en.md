@@ -8,6 +8,28 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 
 > **Disclaimer — not for production use.** This repository is sample code provided for educational and demonstration purposes only. It is **not intended for production use** and is provided "as is" without warranty of any kind. Review, harden, and test it against your own security, compliance, and operational requirements before deploying. Compliance references to NCT (국가핵심기술) describe *supporting controls* the architecture illustrates; they are not a certification or legal assurance of regulatory compliance.
 
+---
+
+## Why this repo exists
+
+**The problem.** Korean manufacturing, defense, and semiconductor customers handling National Core Technology (NCT, 국가핵심기술) cannot let their data — or the access rights to it — leave the country. That means their LLMs must run **only inside the Seoul (ap-northeast-2) region**. But the only frontier-class *managed* model available in-region in Seoul is effectively **Amazon Bedrock's Claude 3.5 Sonnet** (using cross-region inference would route traffic out of the region and break the NCT requirement).
+
+**What that costs you.** The Claude 3.5 Sonnet (`2024-06-20`) you get in-region on Bedrock scores **≈ 33% on SWE-bench Verified** for agentic coding — only **≈ 37%** of today's frontier ceiling (Claude Opus 4.8 ≈ 88.6%). In other words, the moment you lock yourself into Seoul to stay compliant, you give up more than 60% of frontier coding capability. (Even the updated `2024-10-22` revision is ≈ 49% = ≈ 55% of frontier — still a wide gap.)
+
+**This repo's answer — a hedge that recovers ~82% of frontier.** Open-weight models self-hosted on EKS in Seoul keep all traffic in-region while delivering far higher performance. The `coding` model this CDK ships by default, **Qwen3.5-27B**, scores **≈ 72.4% on SWE-bench Verified = ≈ 82% of frontier** (knowledge/math axes land above 90%). That is **more than double** the in-region Bedrock baseline (≈ 37%).
+
+| In-region (Seoul) option | SWE-bench Verified | vs. frontier (Opus 4.8 = 88.6) |
+|----|----|----|
+| Bedrock Claude 3.5 Sonnet (`2024-06-20`) — the only managed option | ≈ 33% | **≈ 37%** |
+| Bedrock Claude 3.5 Sonnet (`2024-10-22`) | ≈ 49% | ≈ 55% |
+| **This CDK's `coding` = Qwen3.5-27B (self-hosted)** | **≈ 72.4%** | **≈ 82%** |
+
+**The message.** The common assumption — *"NCT traps us in Seoul, so we're stuck with a model at 37% of frontier"* — is flipped by this **1-click CDK solution** into *"keep ~80% of frontier in-region in Seoul while staying NCT-compliant on AWS."* Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Bedrock (Seoul) or to self-hosted open-source vLLM. It is not frontier-100%, but ~80% covers most real work — and, critically, it **never breaks data sovereignty.**
+
+> See [How much performance do you give up?](#how-much-performance-do-you-give-up--position-vs-frontier-verified-2026-06) below for the underlying numbers, caveats, and higher-fidelity options (e.g. Qwen3.5-397B). Benchmarks vary by harness/config — **run a PoC on your real workload before adopting.**
+
+---
+
 - **Region pinned**: `ap-northeast-2` (Seoul) — hardcoded in source (supports NCT requirements)
 - **Stacks**: 16 CDK stacks
 - **Models served**: 6 vLLM (scale-to-zero) + 2 Bedrock (ON_DEMAND, IN_REGION)
@@ -135,6 +157,7 @@ Comparing the current `coding` alias (**Qwen3.5-27B**) against the frontier ceil
 | Code gen (LiveCodeBench v6) | 80.7 | ~88 | ≈ 92% |
 
 - **Headline: on the hardest axis — agentic coding (SWE-bench) — it lands at ≈ 82% of frontier.** The gap narrows on knowledge and math (90%+). What remains is concentrated in "the hardest agentic coding."
+- **vs. the in-region managed baseline**: if NCT locks you into Seoul, Bedrock Claude 3.5 Sonnet (`2024-06-20`) is effectively the only frontier-class managed option, and it scores **≈ 33%** on SWE-bench Verified (agentic scaffold, [Anthropic](https://www.anthropic.com/news/swe-bench-sonnet)) = **≈ 37%** of frontier. The updated `2024-10-22` is ≈ 49% (≈ 55%). **Self-hosted Qwen3.5-27B (72.4%, ≈ 82%) more than doubles in-region coding capability over the managed baseline** — this is the core value of this repo (see [Why this repo exists](#why-this-repo-exists) above).
 - **If you need higher fidelity**, swap the `coding` alias for the same Qwen3.5 family flagship **Qwen3.5-397B-A17B** (403B MoE / 17B active, all Apache-2.0, self-hostable) — SWE-bench **76.4** (≈ 86% of frontier), 94–99% on knowledge/math. It requires multiple H200 (P5en) GPUs, so cost rises substantially.
 - ⚠️ **Reading the numbers**: SWE-bench varies ±3–5 points across harnesses/vendors, and the Qwen figures above are model-card peak reasoning mode — real-world default settings may score lower. **Run a PoC on your actual workload before adopting.**
 - Sources: official Qwen HF model cards (`Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-397B-A17B`) cross-checked with vals.ai (SWE-bench), llm-stats (GPQA), Artificial Analysis.

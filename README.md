@@ -8,6 +8,28 @@
 
 > **Disclaimer — 프로덕션 용도 아님.** 본 저장소는 교육·데모 목적의 샘플 코드이며 **프로덕션 사용을 위한 것이 아닙니다**. 어떠한 보증도 없이 "있는 그대로(as is)" 제공됩니다. 배포 전 반드시 자체 보안·컴플라이언스·운영 요건에 맞춰 검토·강화·테스트하십시오. NCT(국가핵심기술) 관련 기술은 이 아키텍처가 보여주는 *지원 컨트롤(supporting controls)*을 설명한 것으로, 규제 준수에 대한 인증이나 법적 보증이 아닙니다.
 
+---
+
+## 왜 이 repo가 필요한가
+
+**문제.** NCT(국가핵심기술)를 다루는 한국 제조·방산·반도체 고객은 데이터와 접근 권한이 국외로 나가면 안 된다. 그래서 LLM도 **서울(ap-northeast-2) 리전 안에서만** 돌려야 한다. 그런데 서울 in-region으로 즉시 쓸 수 있는 frontier 사양의 매니지드 모델은 사실상 **Amazon Bedrock의 Claude 3.5 Sonnet** 하나뿐이다 (cross-region inference를 쓰면 트래픽이 리전을 벗어나 NCT 요건에 어긋난다).
+
+**그 대가가 얼마인가.** Bedrock 서울에 in-region으로 잡히는 Claude 3.5 Sonnet(`2024-06-20`)은 agentic 코딩 기준 **SWE-bench Verified ≈ 33%** 다. 오늘의 frontier 상한(Claude Opus 4.8 ≈ 88.6%) 대비 **≈ 37% 수준**에 불과하다. 즉 "규정을 지키려고 서울에 갇히는 순간, 코딩 능력의 60% 이상을 포기"하게 된다. (업데이트판 `2024-10-22`를 쓸 수 있어도 ≈ 49% = frontier의 ≈ 55%로, 갭은 여전히 크다.)
+
+**이 repo의 해법 — frontier를 ~82%까지 끌어올리는 hedge.** 가중치가 공개된 open-source 모델을 서울 리전 EKS에 self-host하면, 트래픽이 리전을 벗어나지 않으면서도 훨씬 높은 성능을 낼 수 있다. 이 CDK가 기본 탑재한 `coding` 모델 **Qwen3.5-27B**는 **SWE-bench Verified ≈ 72.4% = frontier의 ≈ 82%** 다 (지식·수학 축은 90% 이상으로 더 근접). in-region Bedrock(≈37%)에서 **두 배 이상**으로 올라간다.
+
+| 서울 in-region 선택지 | SWE-bench Verified | frontier(Opus 4.8=88.6) 대비 |
+|----|----|----|
+| Bedrock Claude 3.5 Sonnet (`2024-06-20`) — 매니지드 유일 옵션 | ≈ 33% | **≈ 37%** |
+| Bedrock Claude 3.5 Sonnet (`2024-10-22`) | ≈ 49% | ≈ 55% |
+| **이 CDK의 `coding` = Qwen3.5-27B (self-host)** | **≈ 72.4%** | **≈ 82%** |
+
+**메시지.** *"NCT 때문에 서울에 갇혀 frontier의 37%짜리 모델밖에 못 쓴다"* 는 통념을, 이 **1-click CDK 솔루션**이 *"frontier 대비 80% 수준을 서울 in-region으로 유지하면서 NCT를 AWS에서 준수한다"* 로 바꾼다. 연구원은 **Claude Code CLI를 그대로** 쓰고, gateway가 내부적으로 Bedrock(서울) 또는 self-host open-source vLLM으로 라우팅한다. frontier 100%는 아니지만 80% 수준이면 대부분의 실무를 커버하며, 무엇보다 **데이터 주권을 깨지 않는다.**
+
+> 수치 근거·해석 주의·더 높은 충실도(Qwen3.5-397B 등) 옵션은 아래 [성능은 얼마나 떨어지는가](#성능은-얼마나-떨어지는가--frontier-대비-위치-2026-06-검증) 참고. 벤치마크는 harness·설정에 따라 ±편차가 있으니 **도입 전 실제 워크로드로 PoC 실측** 권장.
+
+---
+
 - **Region 고정**: `ap-northeast-2` (Seoul) — 코드상 하드코딩 (NCT 요건 지원)
 - **배포 완료 스택**: 16개 (모두 `CREATE/UPDATE_COMPLETE`)
 - **서빙 중 모델**: 6종 vLLM (scale-to-zero) + 2종 Bedrock (ON_DEMAND, IN_REGION)
@@ -133,6 +155,7 @@
 | 코드 생성 (LiveCodeBench v6) | 80.7 | ~88 | ≈ 92% |
 
 - **헤드라인: 가장 까다로운 축인 agentic 코딩(SWE-bench)에서 frontier의 ≈ 82% 수준.** 지식·수학으로 갈수록 격차가 줄어 90% 이상으로 근접한다. 남는 갭은 "가장 어려운 agentic 코딩"에 집중된다.
+- **vs. 서울 in-region 매니지드 baseline**: NCT로 서울에 갇히면 Bedrock Claude 3.5 Sonnet(`2024-06-20`)이 사실상 유일한 frontier급 매니지드 옵션인데, 이 모델의 SWE-bench Verified는 **≈ 33%**(agentic scaffold 기준, [Anthropic](https://www.anthropic.com/news/swe-bench-sonnet)) = frontier의 **≈ 37%**. 업데이트판 `2024-10-22`도 ≈ 49%(≈ 55%). **self-host Qwen3.5-27B(72.4%, ≈ 82%)는 in-region 매니지드 대비 코딩 능력을 2배 이상**으로 끌어올린다. 이것이 이 repo의 핵심 가치다 (위 [왜 이 repo가 필요한가](#왜-이-repo가-필요한가) 참고).
 - **더 높은 충실도가 필요하면** 동일 Qwen3.5 패밀리(전부 Apache-2.0, self-host 가능)의 플래그십 **Qwen3.5-397B-A17B**(403B MoE / 17B active)로 `coding` alias를 교체할 수 있다 — SWE-bench **76.4** (frontier의 ≈ 86%), 지식·수학은 94–99%. 단 H200(P5en) 다수가 필요해 비용이 크게 증가한다.
 - ⚠️ **수치 해석 주의**: SWE-bench는 harness·vendor마다 ±3~5점 편차가 있고, 위 Qwen 수치는 모델카드의 peak reasoning mode 기준이라 실서비스 기본 설정에선 더 낮을 수 있다. **도입 전 실제 워크로드로 PoC 실측**을 권장한다.
 - 출처: Qwen 공식 HF 모델카드(`Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-397B-A17B`) + vals.ai(SWE-bench) · llm-stats(GPQA) · Artificial Analysis 교차검증.
