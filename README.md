@@ -306,7 +306,7 @@ cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
 | ALB × 3 (Internal) | — | ~$0.07 |
 | NAT GW | — | ~$0.05 |
 | S3 Storage (모델 캐시) | ~500 GB | ~$0.02 |
-| **상시 합계** | | **~$0.45/hr (~$324/month)** |
+| **상시 합계** | | **\~$0.45/hr (\~$324/month)** |
 
 ### vLLM 모델 기동 시 (alias 별)
 | Alias | 인스턴스 | 시간당 추가 |
@@ -317,7 +317,7 @@ cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
 | longcontext | g6e.48xlarge | ~$30.90 |
 
 자동 스케줄(평일 08:30~19:30 KST, 11h × 21일) 기준 전체 warm-up 시 월 비용:
-- coding + video + ocr + math + audio: ~$17/hr × 231h = ~$3,927
+- coding + video + ocr + math + audio: \~$17/hr × 231h = \~$3,927
 - + longcontext (필요 시만): +$30.90/hr × 사용시간
 
 > 비용 최적화: `longcontext`는 예약(`--alias longcontext`)으로만 기동. 필요 없는 alias는 `minReplicas=0` 유지.

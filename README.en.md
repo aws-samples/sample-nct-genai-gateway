@@ -24,7 +24,7 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 | Bedrock Claude 3.5 Sonnet (`2024-10-22`) | ≈ 49% | ≈ 55% |
 | **This CDK's `coding` = Qwen3.5-27B (self-hosted)** | **≈ 72.4%** | **≈ 82%** |
 
-**The message.** The common assumption — *"NCT traps us in Seoul, so we're stuck with a model at 37% of frontier"* — is flipped by this **1-click CDK solution** into *"keep ~80% of frontier in-region in Seoul while staying NCT-compliant on AWS."* Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Bedrock (Seoul) or to self-hosted open-source vLLM. It is not frontier-100%, but ~80% covers most real work — and, critically, it **never breaks data sovereignty.**
+**The message.** The common assumption — *"NCT traps us in Seoul, so we're stuck with a model at 37% of frontier"* — is flipped by this **1-click CDK solution** into *"keep \~80% of frontier in-region in Seoul while staying NCT-compliant on AWS."* Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Bedrock (Seoul) or to self-hosted open-source vLLM. It is not frontier-100%, but \~80% covers most real work — and, critically, it **never breaks data sovereignty.**
 
 > See [How much performance do you give up?](#how-much-performance-do-you-give-up--position-vs-frontier-verified-2026-06) below for the underlying numbers, caveats, and higher-fidelity options (e.g. Qwen3.5-397B). Benchmarks vary by harness/config — **run a PoC on your real workload before adopting.**
 
@@ -308,7 +308,7 @@ cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
 | ALB × 3 (Internal) | — | ~$0.07 |
 | NAT GW | — | ~$0.05 |
 | S3 Storage (model cache) | ~500 GB | ~$0.02 |
-| **Always-on total** | | **~$0.45/hr (~$324/month)** |
+| **Always-on total** | | **\~$0.45/hr (\~$324/month)** |
 
 ### When vLLM models are running (per alias)
 | Alias | Instance | Per hour (added) |
@@ -319,7 +319,7 @@ cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
 | longcontext | g6e.48xlarge | ~$30.90 |
 
 Monthly cost with the auto schedule (weekdays 08:30–19:30 KST, 11h × 21 days) for full warm-up:
-- coding + video + ocr + math + audio: ~$17/hr × 231h = ~$3,927
+- coding + video + ocr + math + audio: \~$17/hr × 231h = \~$3,927
 - + longcontext (only when needed): +$30.90/hr × hours used
 
 > Cost tip: bring up `longcontext` only via reservation (`--alias longcontext`). Keep unneeded aliases at `minReplicas=0`.
