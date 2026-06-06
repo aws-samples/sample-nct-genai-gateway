@@ -20,6 +20,26 @@ const env = {
   region: 'ap-northeast-2', // NCT 준수: 서울 고정 (환경 변수로 변경 불가)
 };
 
+// Read a context value that may arrive as a real JSON value (from cdk.json /
+// cdk.context.json) or as a string (from the CLI `-c key=value`, which always
+// passes strings). When it's a string, JSON.parse it so `-c operatorRoleArns='[...]'`
+// and `-c vllmEndpoints='{...}'` work the same as the cdk.json defaults.
+function getJsonContext<T>(key: string, fallback: T): T {
+  const raw = app.node.tryGetContext(key);
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== 'string') return raw as T;
+  const trimmed = raw.trim();
+  if (trimmed === '') return fallback;
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch (e) {
+    throw new Error(
+      `Context "${key}" must be valid JSON when passed via -c (got: ${raw}). ` +
+      `Example: -c ${key}='${JSON.stringify(fallback)}'`,
+    );
+  }
+}
+
 const clusterName  = app.node.tryGetContext('clusterName') ?? 'nct-gateway';
 const GATEWAY_ZONE = 'nct-gateway.internal';
 const GATEWAY_DOMAIN = `*.${GATEWAY_ZONE}`;
@@ -28,14 +48,16 @@ const GATEWAY_DOMAIN = `*.${GATEWAY_ZONE}`;
 // First deploy: omit — VllmStack deploys with placeholder endpoints in LiteLLM.
 // After VllmStack deploy, get NLB DNS:
 //   kubectl get svc -n vllm <servingName>-nlb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-// Then set in cdk.json context:
+// Then set via cdk.json context or the CLI:
 //   "vllmEndpoints": { "coding": "http://internal-xxx.elb.amazonaws.com", "ocr": "..." }
+//   -c vllmEndpoints='{"coding":"http://internal-xxx.elb.amazonaws.com"}'
 // and redeploy: cdk deploy NctLiteLLMStack
-const vllmEndpoints: Record<string, string> = app.node.tryGetContext('vllmEndpoints') ?? {};
+const vllmEndpoints = getJsonContext<Record<string, string>>('vllmEndpoints', {});
 
 // operatorRoleArns: IAM role ARNs granted AmazonEKSClusterAdminPolicy for break-glass kubectl.
-// Dev-account default in cdk.json; prod overrides via -c or per-env cdk.json.
-const operatorRoleArns: string[] = app.node.tryGetContext('operatorRoleArns') ?? [];
+// Default [] in cdk.json; override via cdk.json/cdk.context.json or the CLI:
+//   -c operatorRoleArns='["arn:aws:iam::123456789012:role/Admin"]'
+const operatorRoleArns = getJsonContext<string[]>('operatorRoleArns', []);
 
 const networkStack = new NetworkStack(app, 'NctNetworkStack', { env, clusterName });
 
