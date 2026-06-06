@@ -3,4 +3,4 @@ uvicorn[standard]==0.34.2
 httpx==0.28.1
 boto3==1.38.0
 jinja2==3.1.6
-python-multipart==0.0.20
+python-multipart==0.0.32
