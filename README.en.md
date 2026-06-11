@@ -10,7 +10,37 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 
 ---
 
-## Why this repo exists
+## TL;DR
+
+**Who** — Korean manufacturing, defense, and semiconductor customers who must keep all inference inside the Seoul region for National Core Technology (NCT, 국가핵심기술) reasons.
+**What** — Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Seoul in-region Bedrock or to self-hosted open-source vLLM on EKS. Traffic never leaves the region.
+**Why** — In-region managed models alone trap you at ~37% of frontier; this repo's self-hosted `coding` (Qwen3.5-27B) reaches **~82% of frontier** in-region.
+
+**How (2-command):**
+
+```bash
+npm install
+
+# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 16 stacks)
+AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
+
+# [2] Post-deploy — discover NLB DNS → rewire SmartRouter → apply Higress config
+./scripts/finalize-deploy.sh
+```
+
+> There are **required prerequisites** — a HuggingFace token (required), and, if you use `longcontext`/`math`, gated-model license approval. Read **[Prerequisites](#prerequisites)** before you start. Phased deploy and operational options are under **[Deployment](#deployment)**.
+
+- **Region pinned**: `ap-northeast-2` (Seoul) — hardcoded in source (supports NCT requirements)
+- **Stacks**: 16 CDK stacks (17 with the optional test client)
+- **Models served**: 6 vLLM (scale-to-zero) + 2 Bedrock (ON_DEMAND, IN_REGION)
+- **Endpoints**: HTTPS 443, Route 53 Private Hosted Zone (`*.nct-gateway.internal`)
+
+---
+
+<details>
+<summary><strong>Why this repo exists</strong> — NCT locks you into Seoul at ~37% of frontier; this repo lifts that to ~82% via self-hosting (expand for the argument and benchmarks)</summary>
+
+### Why this repo exists
 
 **The problem.** Korean manufacturing, defense, and semiconductor customers handling National Core Technology (NCT, 국가핵심기술) cannot let their data — or the access rights to it — leave the country. That means their LLMs must run **only inside the Seoul (ap-northeast-2) region**. But the only frontier-class *managed* model available in-region in Seoul is effectively **Amazon Bedrock's Claude 3.5 Sonnet** (using cross-region inference would route traffic out of the region and break the NCT requirement).
 
@@ -24,16 +54,11 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 | Bedrock Claude 3.5 Sonnet (`2024-10-22`) | ≈ 49% | ≈ 55% |
 | **This CDK's `coding` = Qwen3.5-27B (self-hosted)** | **≈ 72.4%** | **≈ 82%** |
 
-**The message.** The common assumption — *"NCT traps us in Seoul, so we're stuck with a model at 37% of frontier"* — is flipped by this **2-command CDK solution** (`cdk deploy --all` → `finalize-deploy.sh`) into *"keep \~80% of frontier in-region in Seoul while staying NCT-compliant on AWS."* Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Bedrock (Seoul) or to self-hosted open-source vLLM. It is not frontier-100%, but \~80% covers most real work — and, critically, it **never breaks data sovereignty.**
+**The message.** The common assumption — *"NCT traps us in Seoul, so we're stuck with a model at 37% of frontier"* — is flipped by this **2-command CDK solution** (`cdk deploy --all` → `finalize-deploy.sh`) into *"keep \~80% of frontier in-region in Seoul while staying NCT-compliant on AWS."* It is not frontier-100%, but \~80% covers most real work — and, critically, it **never breaks data sovereignty.**
 
-> See [How much performance do you give up?](#how-much-performance-do-you-give-up--position-vs-frontier-verified-2026-06) below for the underlying numbers, caveats, and higher-fidelity options (e.g. Qwen3.5-397B). Benchmarks vary by harness/config — **run a PoC on your real workload before adopting.**
+> See the *How much performance do you give up?* expandable under **Model Matrix** below for the underlying numbers, caveats, and higher-fidelity options (e.g. Qwen3.5-397B). Benchmarks vary by harness/config — **run a PoC on your real workload before adopting.**
 
----
-
-- **Region pinned**: `ap-northeast-2` (Seoul) — hardcoded in source (supports NCT requirements)
-- **Stacks**: 16 CDK stacks (17 with the optional test client)
-- **Models served**: 6 vLLM (scale-to-zero) + 2 Bedrock (ON_DEMAND, IN_REGION)
-- **Endpoints**: HTTPS 443, Route 53 Private Hosted Zone (`*.nct-gateway.internal`)
+</details>
 
 ---
 
@@ -53,78 +78,88 @@ drives vLLM warmup/cooldown on a weekday 08:30–19:30 KST schedule. The entire 
 
 ---
 
-## CDK Stacks (16)
+## Deployment
 
-| Stack | Role |
-|-------|------|
-| `NctNetworkStack` | VPC 10.0.0.0/16, 3 AZ, NAT GW, VPC Endpoints (S3/DDB/ECR/STS/SM) |
-| `NctEksStack` | EKS Auto Mode v1.32, S3 Mountpoint CSI driver, model-cache S3 bucket |
-| `NctKarpenterStack` | NodePools: cpu / gpu (amd64) / neuron |
-| `NctVllm-Coding` | Qwen3.5-27B (g5.12xlarge, 4×A10G) |
-| `NctVllm-Video` | Qwen3.5-27B (g5.12xlarge, 4×A10G, vision/video) |
-| `NctVllm-Ocr` | InternVL3-14B (g5.12xlarge, 4×A10G) |
-| `NctVllm-Math` | Gemma 4 31B (g6e.12xlarge, 4×L40S) |
-| `NctVllm-Audio` | Phi-4 Multimodal (g5.xlarge, 1×A10G) |
-| `NctVllm-Longcontext` | LLaMA 4 Scout 17B-16E (g6e.48xlarge, 8×L40S) |
-| `NctCertStack` | Self-signed wildcard cert `*.nct-gateway.internal` → ACM + Secrets Manager (CA) |
-| `NctHigressStack` | Higress AI Gateway (EKS Helm) + Bedrock IAM user / consumer-key Secrets. The Helm release + internal NLB 443 render into `NctEksStack` |
-| `NctSmartRouterStack` | SmartRouter ECS Fargate, Internal ALB 443 |
-| `NctWarmupStack` | Step Functions (Warmup / Cooldown) |
-| `NctReservationStack` | DynamoDB reservation + reserve/expire Lambda + EventBridge |
-| `NctAdminConsoleStack` | FastAPI ECS + ALB (`admin.nct-gateway.internal`) |
-| `NctDnsStack` | Route53 PHZ `nct-gateway.internal` + alias records |
+### Prerequisites
 
----
+- AWS CLI configured (`ap-northeast-2` credentials)
+- Node.js >= 18, `npm install -g aws-cdk`
+- CDK Bootstrap in `ap-northeast-2`
+- **HuggingFace token (required)** — see step 1 below.
+- **Gated model license approval (optional)** — only when deploying `longcontext`/`math`. See step 2 below.
 
-## Model Matrix
+#### 1. Create a HuggingFace token + register it in Secrets Manager (required)
 
-### vLLM (EKS Auto Mode, scale-to-zero)
+vLLM pods use the HF token to pull model weights. **If it is missing, vLLM pods fail to start (while the GPU node they triggered keeps billing) and `NctEksStack` deployment fails fast** — a deploy-time sanity check rejects an absent `hf-token`.
 
-| Alias | Model | EC2 | GPU | Max Ctx | Loading (warm cache) |
-|-------|-------|-----|-----|---------|----------------------|
-| `coding` | Qwen3.5-27B | g5.12xlarge | 4×A10G | 32,768 | ~8 min (SWE-bench 72.4%) |
-| `video` | Qwen3.5-27B | g5.12xlarge | 4×A10G | 32,768 | ~8 min |
-| `ocr` | InternVL3-14B | g5.12xlarge | 4×A10G | 8,192 | ~5 min |
-| `math` | Gemma 4 31B | g6e.12xlarge | 4×L40S | 32,768 | ~6–8 min |
-| `audio` | Phi-4 Multimodal | g5.xlarge | 1×A10G | 16,384 | ~5–7 min |
-| `longcontext` | LLaMA 4 Scout 17B-16E | g6e.48xlarge | 8×L40S | 131,072 | **~35 min** |
+1. Sign up / log in at [huggingface.co](https://huggingface.co/join).
+2. **Settings → Access Tokens → New token** → choose Type **Read** → copy the generated `hf_...` token. (Read scope is enough — it is only used to download weights.)
+3. Register that token in Secrets Manager (the key *inside* the secret must be named `token`):
 
-> Benchmark figures vary by model version — verify against the current model card before relying on them.
+   ```bash
+   aws secretsmanager create-secret \
+     --name hf-token \
+     --secret-string '{"token":"hf_xxxxxxxx"}' \
+     --region ap-northeast-2
+   ```
 
-- **scale-to-zero**: `minReplicas=0` — GPU nodes are released when idle; the next request triggers Karpenter to provision a node and start vLLM.
-- **All warmup (parallel)**: ~35 min, bounded by the slowest model (LLaMA 4 Scout).
-- **Cache location**: S3 Mountpoint (`s3://<model-cache-bucket>/<servingName>/`).
-- **LLaMA 4 Scout note**: `--enforce-eager` is required (disables CUDA graph capture to avoid >20 min boot).
+#### 2. Approve gated-model licenses (optional — only if you use `longcontext`/`math`)
 
-### How much performance do you give up? — position vs. frontier (verified 2026-06)
+**2 of the 6 default models are gated** — they require accepting a license on HF before they can be downloaded. Deploying without approval makes those vLLM pods fail to start with an **HF 401/403**.
 
-> When data-sovereignty requirements stop you from using frontier proprietary models (Claude Opus, GPT, etc.) and you substitute self-hosted open-weight models, you should know **how much capability you're trading away** before adopting.
+| Alias | Model | Approval step |
+|-------|-------|---------------|
+| `longcontext` | [`meta-llama/Llama-4-Scout-17B-16E-Instruct`](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | Accept the Meta license + get the access request approved on the model card |
+| `math` | [`google/gemma-4-31b-it`](https://huggingface.co/google/gemma-4-31b-it) | Accept the Google Gemma license on the model card |
 
-Comparing the current `coding` alias (**Qwen3.5-27B**) against the frontier ceiling (normalized so that `max(GPT-5.5, Claude Opus 4.8) = 100`):
+- Click "Agree and access" (the access request) on each model card **using the same HF account you minted the token with**.
+- The other four (`coding`/`video` = Qwen3.5-27B [Apache-2.0], `ocr` = InternVL3-14B, `audio` = Phi-4 Multimodal) are **not gated** — no extra approval needed.
+- **If you won't use those two models**, simply leave their vLLM stacks (`NctVllm-Longcontext`/`NctVllm-Math`) out of the deploy (omit them in the *Phased deploy* below, or skip them in `cdk deploy`). The remaining stacks deploy fine without any gated approval.
+- ⚠️ Whether a model is gated, and its license terms, are model-card policy and can change. **Verify on each model card at deploy time.**
 
-| Axis | Qwen3.5-27B | Frontier ceiling | **vs. frontier** |
-|------|-------------|------------------|------------------|
-| Coding (SWE-bench Verified) | 72.4 | 88.6 (Opus 4.8) | **≈ 82%** |
-| Knowledge (GPQA Diamond) | 85.5 | 93.6 | ≈ 91% |
-| Math (AIME 2026) | 90.8 | ~96.7 | ≈ 94% |
-| Code gen (LiveCodeBench v6) | 80.7 | ~88 | ≈ 92% |
+### Deploy (2-command)
 
-- **Headline: on the hardest axis — agentic coding (SWE-bench) — it lands at ≈ 82% of frontier.** The gap narrows on knowledge and math (90%+). What remains is concentrated in "the hardest agentic coding."
-- **vs. the in-region managed baseline**: if NCT locks you into Seoul, Bedrock Claude 3.5 Sonnet (`2024-06-20`) is effectively the only frontier-class managed option, and it scores **≈ 33%** on SWE-bench Verified (agentic scaffold, [Anthropic](https://www.anthropic.com/news/swe-bench-sonnet)) = **≈ 37%** of frontier. The updated `2024-10-22` is ≈ 49% (≈ 55%). **Self-hosted Qwen3.5-27B (72.4%, ≈ 82%) more than doubles in-region coding capability over the managed baseline** — this is the core value of this repo (see [Why this repo exists](#why-this-repo-exists) above).
-- **If you need higher fidelity**, swap the `coding` alias for the same Qwen3.5 family flagship **Qwen3.5-397B-A17B** (403B MoE / 17B active, all Apache-2.0, self-hostable) — SWE-bench **76.4** (≈ 86% of frontier), 94–99% on knowledge/math. It requires multiple H200 (P5en) GPUs, so cost rises substantially.
-- ⚠️ **Reading the numbers**: SWE-bench varies ±3–5 points across harnesses/vendors, and the Qwen figures above are model-card peak reasoning mode — real-world default settings may score lower. **Run a PoC on your actual workload before adopting.**
-- Sources: official Qwen HF model cards (`Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-397B-A17B`) cross-checked with vals.ai (SWE-bench), llm-stats (GPQA), Artificial Analysis.
+The crux of the gateway data plane is the NLBs that k8s provisions **after** deploy (6 vLLM + the Higress gateway). Their DNS is unknown at synth time and can't be hardcoded with a CDK token, so **infrastructure** and **post-deploy wiring** split into two commands:
 
-### Bedrock (ON_DEMAND / IN_REGION Seoul)
+```bash
+npm install
 
-| Alias | Bedrock Model ID | Use |
-|-------|------------------|-----|
-| `claude-3-5-sonnet-20241022` | `anthropic.claude-3-5-sonnet-20240620-v1:0` | Default target for Claude Code CLI |
-| `claude-3-haiku-20240307` | `anthropic.claude-3-haiku-20240307-v1:0` | Fast / low-cost (⚠️ check model EOL in the Bedrock console and update the alias to a successor) |
+# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 16 stacks)
+AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 
-> **Alias ≠ served model ID**: in the first row the client alias (`...20241022`) and the actually-served Bedrock Model ID (`...20240620-v1:0`) intentionally differ. The left is the model string Claude Code CLI sends; the right is the Sonnet 3.5 that actually answers in-region in Seoul. This maps whichever Sonnet alias the CLI sends to the in-region model.
+# [2] Post-deploy — discover NLB DNS → rewire SmartRouter → apply Higress config
+./scripts/finalize-deploy.sh
+```
 
-> **If you need an "OpenAI-family" model**: proprietary GPT (e.g. gpt-5.x) has closed weights and cannot be self-hosted. Open-weight **gpt-oss-20b / gpt-oss-120b**, however, can be added as vLLM aliases and run in-region in Seoul. For a Bedrock path, confirm Seoul in-region availability in the console first.
+`finalize-deploy.sh` handles the rest in one shot (zero copy-paste):
+
+1. **Discover NLB DNS** — looks up the 6 vLLM + Higress gateway NLB DNS via `kubectl` and writes them into the `cdk.json` context (`vllmEndpoints`, `higressEndpoint`) — `scripts/get-endpoints.sh --write-context`.
+2. **Rewire SmartRouter** — `cdk deploy NctSmartRouterStack -c higressEndpoint=<discovered>` points the upstream at the Higress gateway NLB.
+3. **Apply Higress config** — provider/route/key-auth consumer via the console REST API (`scripts/apply-higress.sh`). **On a first deploy with no console admin yet, it auto-bootstraps via `/system/init`** (admin PW fixed to the gateway master-key, recoverable from Secrets Manager afterward).
+
+On completion it prints a banner with the entry point (`https://gateway.nct-gateway.internal`), how to fetch the master-key, and how to try the test client. Re-running is idempotent (re-discover NLB DNS → SmartRouter no-op → Higress upsert).
+
+> **Operators**: `operatorRoleArns` in `cdk.json` ships empty (`vllmEndpoints`/`higressEndpoint` are filled by `finalize-deploy.sh`). Pass your own break-glass role ARN(s) via `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'` (or set them in your own `cdk.json`); the app handles empty values.
+
+### Phased deploy (recommended)
+
+```bash
+# Phase 0: network + EKS + Karpenter
+cdk deploy NctNetworkStack NctEksStack NctKarpenterStack
+
+# Phase 1-6: per-model vLLM (optional)
+#   add gated models (NctVllm-Longcontext, NctVllm-Math) only after HF approval
+cdk deploy NctVllm-Coding
+# (add the rest after researcher feedback)
+
+# Phase 7-10: cert + Higress + SmartRouter + Warmup + Reservation + Admin + DNS
+#   (NctHigressStack's Helm release/NLB render into NctEksStack, so redeploy NctEksStack too)
+cdk deploy NctCertStack NctEksStack NctHigressStack NctSmartRouterStack \
+           NctWarmupStack NctReservationStack NctAdminConsoleStack NctDnsStack
+
+# Post-deploy: discover NLB DNS → rewire SmartRouter → apply Higress config
+./scripts/finalize-deploy.sh
+```
 
 ---
 
@@ -181,120 +216,6 @@ curl https://gateway.nct-gateway.internal/v1/messages \
 
 ---
 
-## Warm-up / Reservation
-
-vLLM models sit at `scale-to-zero` when idle, so the first request incurs a 5–35 min cold start. To warm up ahead of time:
-
-```bash
-# warm up a specific alias for 1 hour
-scripts/warmup-request.sh --alias coding --requester andrew
-
-# multiple aliases + duration
-scripts/warmup-request.sh --alias coding,math --duration 2h --requester andrew
-
-# all models for 30 min
-scripts/warmup-request.sh --alias all --duration 30m
-```
-
-- Reservations are stored in DynamoDB `NctWarmupReservations` → `reserve-fn` triggers the Warmup state machine.
-- On expiry, `expire-fn` triggers the Cooldown state machine (extended if overlapping reservations exist).
-- **Auto schedule**: weekdays 08:30–19:30 KST, an EventBridge rule warms up all aliases.
-- **Admin Console**: `https://admin.nct-gateway.internal` — view current reservations/state and operate manually.
-
----
-
-## Admin Console
-
-- URL: `https://admin.nct-gateway.internal` (internal network)
-- Auth: Basic Auth — password in Secrets Manager `/nct/admin-console/password`
-- Features:
-  - Current replicas / node status per alias
-  - Active reservations and remaining time
-  - Manual warm-up / cool-down
-  - Gateway logs / Bedrock call stats (basic)
-
----
-
-## NCT Requirements — Supporting Controls
-
-> ⚠️ The technical controls below **support** NCT requirements; deploying this code does not by itself make you "compliant." Actual NCT compliance is a holistic judgment that includes your organization's policies, personnel access controls, auditing, and legal review. Run your own security and legal review.
-
-| Requirement | Supporting technical control |
-|-------------|------------------------------|
-| All inference in Seoul | `bin/nct-genai-gateway.ts` — region hardcoded |
-| Bedrock IN_REGION only | all `BEDROCK_MODELS` in `config/models.ts` are `ap-northeast-2` |
-| Bedrock ON_DEMAND only | no Provisioned Throughput / Cross-region Inference |
-| Researcher network isolation | Internal ALB + Route53 PHZ, no public endpoint |
-| Data in transit encryption | ACM + HTTPS 443 (self-signed wildcard cert) |
-| Model weight isolation | S3 bucket in Seoul, per-alias prefix, node IAM scoped |
-| AWS API egress | VPC Endpoints (S3/DDB/ECR/STS/SM) — bypasses NAT |
-
-> **Why not Cross-Region Inference (CRIS)?** Even when you call a frontier Bedrock model from Seoul, if that model is offered only via CRIS (a geographic inference profile) rather than in-region, your input prompts and outputs are routed to other regions within the same geography (e.g. APAC) during inference — storage stays in the source region, but **processing leaves Seoul** ([AWS docs](https://docs.aws.amazon.com/bedrock/latest/userguide/geographic-cross-region-inference.html): *"your input prompts and output results might move outside of your source Region during cross-Region inference"*). That is unsuitable where in-country data residency is a requirement. This gateway therefore (1) uses only Seoul **IN_REGION on-demand** Bedrock models, and (2) routes everything else to **self-hosted vLLM** on EKS, so inference never leaves Seoul.
-
----
-
-## Deployment
-
-### Prerequisites
-- AWS CLI configured (`ap-northeast-2` credentials)
-- Node.js >= 18, `npm install -g aws-cdk`
-- CDK Bootstrap in `ap-northeast-2`
-- **HuggingFace token secret (required)** — used by vLLM pods to pull model weights. Create it in Secrets Manager before deploying. **If it is missing, vLLM pods fail to start (while the GPU node they triggered keeps billing) and `NctEksStack` deployment fails fast** — a deploy-time sanity check rejects an absent `hf-token`:
-
-  ```bash
-  aws secretsmanager create-secret \
-    --name hf-token \
-    --secret-string '{"token":"hf_xxxxxxxx"}' \
-    --region ap-northeast-2
-  ```
-
-  > The token key must be named `token`. Gated models (e.g. LLaMA 4 Scout) require prior license approval on the same HF account.
-
-### Deploy (2-command)
-
-The crux of the gateway data plane is the NLBs that k8s provisions **after** deploy (6 vLLM + the Higress gateway). Their DNS is unknown at synth time and can't be hardcoded with a CDK token, so **infrastructure** and **post-deploy wiring** split into two commands:
-
-```bash
-npm install
-
-# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 16 stacks)
-AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
-
-# [2] Post-deploy — discover NLB DNS → rewire SmartRouter → apply Higress config
-./scripts/finalize-deploy.sh
-```
-
-`finalize-deploy.sh` handles the rest in one shot (zero copy-paste):
-
-1. **Discover NLB DNS** — looks up the 6 vLLM + Higress gateway NLB DNS via `kubectl` and writes them into the `cdk.json` context (`vllmEndpoints`, `higressEndpoint`) — `scripts/get-endpoints.sh --write-context`.
-2. **Rewire SmartRouter** — `cdk deploy NctSmartRouterStack -c higressEndpoint=<discovered>` points the upstream at the Higress gateway NLB.
-3. **Apply Higress config** — provider/route/key-auth consumer via the console REST API (`scripts/apply-higress.sh`). **On a first deploy with no console admin yet, it auto-bootstraps via `/system/init`** (admin PW fixed to the gateway master-key, recoverable from Secrets Manager afterward).
-
-On completion it prints a banner with the entry point (`https://gateway.nct-gateway.internal`), how to fetch the master-key, and how to try the test client. Re-running is idempotent (re-discover NLB DNS → SmartRouter no-op → Higress upsert).
-
-> **Operators**: `operatorRoleArns` in `cdk.json` ships empty (`vllmEndpoints`/`higressEndpoint` are filled by `finalize-deploy.sh`). Pass your own break-glass role ARN(s) via `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'` (or set them in your own `cdk.json`); the app handles empty values.
-
-### Phased deploy (recommended)
-
-```bash
-# Phase 0: network + EKS + Karpenter
-cdk deploy NctNetworkStack NctEksStack NctKarpenterStack
-
-# Phase 1-6: per-model vLLM (optional)
-cdk deploy NctVllm-Coding
-# (add the rest after researcher feedback)
-
-# Phase 7-10: cert + Higress + SmartRouter + Warmup + Reservation + Admin + DNS
-#   (NctHigressStack's Helm release/NLB render into NctEksStack, so redeploy NctEksStack too)
-cdk deploy NctCertStack NctEksStack NctHigressStack NctSmartRouterStack \
-           NctWarmupStack NctReservationStack NctAdminConsoleStack NctDnsStack
-
-# Post-deploy: discover NLB DNS → rewire SmartRouter → apply Higress config
-./scripts/finalize-deploy.sh
-```
-
----
-
 ## Try it: in-VPC test client (optional)
 
 To experience the gateway hands-on, you can deploy one test EC2 instance inside the VPC. It boots with Claude Code (the GenAI harness) pre-installed and wired to the gateway, reachable **only via SSM Session Manager** (no public IP, no SSH — it tunnels in over the SSM VPC endpoints).
@@ -339,7 +260,144 @@ nct coding          # scale the alias back to zero replicas
 
 ---
 
-## Key Design Decisions
+## Model Matrix
+
+### vLLM (EKS Auto Mode, scale-to-zero)
+
+| Alias | Model | License | EC2 | GPU | Max Ctx | Loading (warm cache) | Headline benchmark |
+|-------|-------|---------|-----|-----|---------|----------------------|--------------------|
+| `coding` | Qwen3.5-27B | Apache-2.0 | g5.12xlarge | 4×A10G | 32,768 | ~8 min | SWE-bench 72.4% / LCB v6 80.7% |
+| `video` | Qwen3.5-27B | Apache-2.0 | g5.12xlarge | 4×A10G | 32,768 | ~8 min | MMMU 85.0 (vision/video) |
+| `ocr` | InternVL3-14B | MIT | g5.12xlarge | 4×A10G | 8,192 | ~5 min | DocVQA 94.1 / OCRBench 875 |
+| `math` | Gemma 4 31B | **gated** (Gemma) | g6e.12xlarge | 4×L40S | 32,768 | ~6–8 min | AIME 2026 89.2% / GPQA 84.3% |
+| `audio` | Phi-4 Multimodal | MIT | g5.xlarge | 1×A10G | 16,384 | ~5–7 min | unified audio+vision |
+| `longcontext` | LLaMA 4 Scout 17B-16E | **gated** (Meta) | g6e.48xlarge | 8×L40S | 131,072 | **~35 min** | 128K context / MoE (17B active) |
+
+- **Gated models** (`math`·`longcontext`) require prior HF license approval — see [Prerequisites](#prerequisites) step 2. If you don't use them, just leave their stacks out of the deploy.
+- **scale-to-zero**: `minReplicas=0` — GPU nodes are released when idle; the next request triggers Karpenter to provision a node and start vLLM.
+- **All warmup (parallel)**: ~35 min, bounded by the slowest model (LLaMA 4 Scout).
+- **Cache location**: S3 Mountpoint (`s3://<model-cache-bucket>/<servingName>/`).
+- **LLaMA 4 Scout note**: `--enforce-eager` is required (disables CUDA graph capture to avoid >20 min boot).
+- ⚠️ Licenses and benchmark figures are per the model card and can change — **verify on each model card at deploy time.**
+
+### Bedrock (ON_DEMAND / IN_REGION Seoul)
+
+| Alias | Bedrock Model ID | Use |
+|-------|------------------|-----|
+| `claude-3-5-sonnet-20241022` | `anthropic.claude-3-5-sonnet-20240620-v1:0` | Default target for Claude Code CLI |
+| `claude-3-haiku-20240307` | `anthropic.claude-3-haiku-20240307-v1:0` | Fast / low-cost (⚠️ check model EOL in the Bedrock console and update the alias to a successor) |
+
+> **Alias ≠ served model ID**: in the first row the client alias (`...20241022`) and the actually-served Bedrock Model ID (`...20240620-v1:0`) intentionally differ. The left is the model string Claude Code CLI sends; the right is the Sonnet 3.5 that actually answers in-region in Seoul. This maps whichever Sonnet alias the CLI sends to the in-region model.
+
+> **If you need an "OpenAI-family" model**: proprietary GPT (e.g. gpt-5.x) has closed weights and cannot be self-hosted. Open-weight **gpt-oss-20b / gpt-oss-120b**, however, can be added as vLLM aliases and run in-region in Seoul. For a Bedrock path, confirm Seoul in-region availability in the console first.
+
+<details>
+<summary><strong>How much performance do you give up?</strong> — position vs. frontier, higher-fidelity options, caveats (verified 2026-06, expand)</summary>
+
+### How much performance do you give up? — position vs. frontier (verified 2026-06)
+
+> When data-sovereignty requirements stop you from using frontier proprietary models (Claude Opus, GPT, etc.) and you substitute self-hosted open-weight models, you should know **how much capability you're trading away** before adopting.
+
+Comparing the current `coding` alias (**Qwen3.5-27B**) against the frontier ceiling (normalized so that `max(GPT-5.5, Claude Opus 4.8) = 100`):
+
+| Axis | Qwen3.5-27B | Frontier ceiling | **vs. frontier** |
+|------|-------------|------------------|------------------|
+| Coding (SWE-bench Verified) | 72.4 | 88.6 (Opus 4.8) | **≈ 82%** |
+| Knowledge (GPQA Diamond) | 85.5 | 93.6 | ≈ 91% |
+| Math (AIME 2026) | 90.8 | ~96.7 | ≈ 94% |
+| Code gen (LiveCodeBench v6) | 80.7 | ~88 | ≈ 92% |
+
+- **Headline: on the hardest axis — agentic coding (SWE-bench) — it lands at ≈ 82% of frontier.** The gap narrows on knowledge and math (90%+). What remains is concentrated in "the hardest agentic coding."
+- **vs. the in-region managed baseline**: if NCT locks you into Seoul, Bedrock Claude 3.5 Sonnet (`2024-06-20`) is effectively the only frontier-class managed option, and it scores **≈ 33%** on SWE-bench Verified (agentic scaffold, [Anthropic](https://www.anthropic.com/news/swe-bench-sonnet)) = **≈ 37%** of frontier. The updated `2024-10-22` is ≈ 49% (≈ 55%). **Self-hosted Qwen3.5-27B (72.4%, ≈ 82%) more than doubles in-region coding capability over the managed baseline** — this is the core value of this repo (see *TL;DR* and the *Why this repo exists* expandable above).
+- **If you need higher fidelity**, swap the `coding` alias for the same Qwen3.5 family flagship **Qwen3.5-397B-A17B** (403B MoE / 17B active, all Apache-2.0, self-hostable) — SWE-bench **76.4** (≈ 86% of frontier), 94–99% on knowledge/math. It requires multiple H200 (P5en) GPUs, so cost rises substantially.
+- ⚠️ **Reading the numbers**: SWE-bench varies ±3–5 points across harnesses/vendors, and the Qwen figures above are model-card peak reasoning mode — real-world default settings may score lower. **Run a PoC on your actual workload before adopting.**
+- Sources: official Qwen HF model cards (`Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-397B-A17B`) cross-checked with vals.ai (SWE-bench), llm-stats (GPQA), Artificial Analysis.
+
+</details>
+
+---
+
+<details>
+<summary><strong>CDK Stacks (16)</strong> — per-stack role table (expand)</summary>
+
+| Stack | Role |
+|-------|------|
+| `NctNetworkStack` | VPC 10.0.0.0/16, 3 AZ, NAT GW, VPC Endpoints (S3/DDB/ECR/STS/SM) |
+| `NctEksStack` | EKS Auto Mode v1.32, S3 Mountpoint CSI driver, model-cache S3 bucket |
+| `NctKarpenterStack` | NodePools: cpu / gpu (amd64) / neuron |
+| `NctVllm-Coding` | Qwen3.5-27B (g5.12xlarge, 4×A10G) |
+| `NctVllm-Video` | Qwen3.5-27B (g5.12xlarge, 4×A10G, vision/video) |
+| `NctVllm-Ocr` | InternVL3-14B (g5.12xlarge, 4×A10G) |
+| `NctVllm-Math` | Gemma 4 31B (g6e.12xlarge, 4×L40S) — gated |
+| `NctVllm-Audio` | Phi-4 Multimodal (g5.xlarge, 1×A10G) |
+| `NctVllm-Longcontext` | LLaMA 4 Scout 17B-16E (g6e.48xlarge, 8×L40S) — gated |
+| `NctCertStack` | Self-signed wildcard cert `*.nct-gateway.internal` → ACM + Secrets Manager (CA) |
+| `NctHigressStack` | Higress AI Gateway (EKS Helm) + Bedrock IAM user / consumer-key Secrets. The Helm release + internal NLB 443 render into `NctEksStack` |
+| `NctSmartRouterStack` | SmartRouter ECS Fargate, Internal ALB 443 |
+| `NctWarmupStack` | Step Functions (Warmup / Cooldown) |
+| `NctReservationStack` | DynamoDB reservation + reserve/expire Lambda + EventBridge |
+| `NctAdminConsoleStack` | FastAPI ECS + ALB (`admin.nct-gateway.internal`) |
+| `NctDnsStack` | Route53 PHZ `nct-gateway.internal` + alias records |
+
+</details>
+
+<details>
+<summary><strong>Warm-up / Reservation</strong> — pre-warm cold starts, auto schedule (expand)</summary>
+
+vLLM models sit at `scale-to-zero` when idle, so the first request incurs a 5–35 min cold start. To warm up ahead of time:
+
+```bash
+# warm up a specific alias for 1 hour
+scripts/warmup-request.sh --alias coding --requester andrew
+
+# multiple aliases + duration
+scripts/warmup-request.sh --alias coding,math --duration 2h --requester andrew
+
+# all models for 30 min
+scripts/warmup-request.sh --alias all --duration 30m
+```
+
+- Reservations are stored in DynamoDB `NctWarmupReservations` → `reserve-fn` triggers the Warmup state machine.
+- On expiry, `expire-fn` triggers the Cooldown state machine (extended if overlapping reservations exist).
+- **Auto schedule**: weekdays 08:30–19:30 KST, an EventBridge rule warms up all aliases.
+- **Admin Console**: `https://admin.nct-gateway.internal` — view current reservations/state and operate manually.
+
+</details>
+
+<details>
+<summary><strong>Admin Console</strong> — operator console (replicas, reservations, manual scale) (expand)</summary>
+
+- URL: `https://admin.nct-gateway.internal` (internal network)
+- Auth: Basic Auth — password in Secrets Manager `/nct/admin-console/password`
+- Features:
+  - Current replicas / node status per alias
+  - Active reservations and remaining time
+  - Manual warm-up / cool-down
+  - Gateway logs / Bedrock call stats (basic)
+
+</details>
+
+<details>
+<summary><strong>NCT Requirements — Supporting Controls</strong> — control mapping + why not CRIS (expand)</summary>
+
+> ⚠️ The technical controls below **support** NCT requirements; deploying this code does not by itself make you "compliant." Actual NCT compliance is a holistic judgment that includes your organization's policies, personnel access controls, auditing, and legal review. Run your own security and legal review.
+
+| Requirement | Supporting technical control |
+|-------------|------------------------------|
+| All inference in Seoul | `bin/nct-genai-gateway.ts` — region hardcoded |
+| Bedrock IN_REGION only | all `BEDROCK_MODELS` in `config/models.ts` are `ap-northeast-2` |
+| Bedrock ON_DEMAND only | no Provisioned Throughput / Cross-region Inference |
+| Researcher network isolation | Internal ALB + Route53 PHZ, no public endpoint |
+| Data in transit encryption | ACM + HTTPS 443 (self-signed wildcard cert) |
+| Model weight isolation | S3 bucket in Seoul, per-alias prefix, node IAM scoped |
+| AWS API egress | VPC Endpoints (S3/DDB/ECR/STS/SM) — bypasses NAT |
+
+> **Why not Cross-Region Inference (CRIS)?** Even when you call a frontier Bedrock model from Seoul, if that model is offered only via CRIS (a geographic inference profile) rather than in-region, your input prompts and outputs are routed to other regions within the same geography (e.g. APAC) during inference — storage stays in the source region, but **processing leaves Seoul** ([AWS docs](https://docs.aws.amazon.com/bedrock/latest/userguide/geographic-cross-region-inference.html): *"your input prompts and output results might move outside of your source Region during cross-Region inference"*). That is unsuitable where in-country data residency is a requirement. This gateway therefore (1) uses only Seoul **IN_REGION on-demand** Bedrock models, and (2) routes everything else to **self-hosted vLLM** on EKS, so inference never leaves Seoul.
+
+</details>
+
+<details>
+<summary><strong>Key Design Decisions</strong> — EKS Auto Mode, S3 Mountpoint, smart routing, Higress conversion, Pod Identity (expand)</summary>
 
 ### EKS Auto Mode v1.32
 - Uses `aws-cdk-lib/aws-eks-v2` (Auto Mode support)
@@ -369,9 +427,10 @@ nct coding          # scale the alias back to zero replicas
 - Bedrock calls and S3 Mountpoint both use EKS Pod Identity
 - The S3 Mountpoint CSI driver also wires up an OIDC-based IRSA path
 
----
+</details>
 
-## Cost Model
+<details>
+<summary><strong>Cost Model</strong> — scale-to-zero ~$0.45/hr, per-alias add when models run (expand)</summary>
 
 ### scale-to-zero (always on)
 | Component | Instance | Per hour |
@@ -398,12 +457,12 @@ Monthly cost with the auto schedule (weekdays 08:30–19:30 KST, 11h × 21 days)
 - + longcontext (only when needed): +$30.90/hr × hours used
 
 > Cost tip: bring up `longcontext` only via reservation (`--alias longcontext`). Keep unneeded aliases at `minReplicas=0`.
-
 > All prices are rough estimates as of authoring. Confirm current rates with the [AWS Pricing Calculator](https://calculator.aws/).
 
----
+</details>
 
-## Operations
+<details>
+<summary><strong>Operations</strong> — manual scale, logs, health checks (expand)</summary>
 
 ### Manual scale
 ```bash
@@ -430,9 +489,10 @@ curl https://gateway.nct-gateway.internal/health/liveliness
 kubectl exec -n vllm <curl-pod> -- curl -sk https://<higress-nlb>:443/
 ```
 
----
+</details>
 
-## Test Report
+<details>
+<summary><strong>Test Report</strong> — E2E 4/4 PASS + 3 resolved corner cases (expand)</summary>
 
 Measured from an in-VPC client against the gateway entry point (`gateway.nct-gateway.internal`, Anthropic Messages API `/v1/messages`, `x-api-key` master key) on a deployed environment. All four core paths passed, and three corner cases found in operation were resolved.
 
@@ -457,15 +517,18 @@ Measured from an in-VPC client against the gateway entry point (`gateway.nct-gat
 
 [higress#3809]: https://github.com/alibaba/higress/issues/3809
 
----
+</details>
 
-## Known Issues
+<details>
+<summary><strong>Known Issues</strong> (expand)</summary>
 
 | # | Issue | Status |
 |---|-------|--------|
 | I1 | Bottlerocket + EFS TLS mount failure | Worked around with S3 Mountpoint (stable in operation) |
 | I8 | No per-researcher API keys | Single shared master key. To be split with Higress consumer key-auth (per-researcher consumers) |
 | — | Bedrock model EOL | Update the alias to a Seoul IN_REGION successor; check EOL dates in the Bedrock console |
+
+</details>
 
 ---
 
