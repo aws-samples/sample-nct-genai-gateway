@@ -24,14 +24,14 @@
 | Bedrock Claude 3.5 Sonnet (`2024-10-22`) | ≈ 49% | ≈ 55% |
 | **이 CDK의 `coding` = Qwen3.5-27B (self-host)** | **≈ 72.4%** | **≈ 82%** |
 
-**메시지.** *"NCT 때문에 서울에 갇혀 frontier의 37%짜리 모델밖에 못 쓴다"* 는 통념을, 이 **1-click CDK 솔루션**이 *"frontier 대비 80% 수준을 서울 in-region으로 유지하면서 NCT를 AWS에서 준수한다"* 로 바꾼다. 연구원은 **Claude Code CLI를 그대로** 쓰고, gateway가 내부적으로 Bedrock(서울) 또는 self-host open-source vLLM으로 라우팅한다. frontier 100%는 아니지만 80% 수준이면 대부분의 실무를 커버하며, 무엇보다 **데이터 주권을 깨지 않는다.**
+**메시지.** *"NCT 때문에 서울에 갇혀 frontier의 37%짜리 모델밖에 못 쓴다"* 는 통념을, 이 **2-command CDK 솔루션**(`cdk deploy --all` → `finalize-deploy.sh`)이 *"frontier 대비 80% 수준을 서울 in-region으로 유지하면서 NCT를 AWS에서 준수한다"* 로 바꾼다. 연구원은 **Claude Code CLI를 그대로** 쓰고, gateway가 내부적으로 Bedrock(서울) 또는 self-host open-source vLLM으로 라우팅한다. frontier 100%는 아니지만 80% 수준이면 대부분의 실무를 커버하며, 무엇보다 **데이터 주권을 깨지 않는다.**
 
 > 수치 근거·해석 주의·더 높은 충실도(Qwen3.5-397B 등) 옵션은 아래 [성능은 얼마나 떨어지는가](#성능은-얼마나-떨어지는가--frontier-대비-위치-2026-06-검증) 참고. 벤치마크는 harness·설정에 따라 ±편차가 있으니 **도입 전 실제 워크로드로 PoC 실측** 권장.
 
 ---
 
 - **Region 고정**: `ap-northeast-2` (Seoul) — 코드상 하드코딩 (NCT 요건 지원)
-- **배포 완료 스택**: 16개 (모두 `CREATE/UPDATE_COMPLETE`)
+- **스택 수**: 16개 (옵션 테스트 클라이언트 포함 시 17개)
 - **서빙 중 모델**: 6종 vLLM (scale-to-zero) + 2종 Bedrock (ON_DEMAND, IN_REGION)
 - **엔드포인트**: HTTPS 443, Route53 Private Hosted Zone (`*.nct-gateway.internal`)
 
@@ -119,6 +119,8 @@ Reservation(EventBridge + Lambda + DynamoDB + Step Functions)이
 |-------|------------------|------|
 | `claude-3-5-sonnet-20241022` | `anthropic.claude-3-5-sonnet-20240620-v1:0` | Claude Code CLI 기본 target |
 | `claude-3-haiku-20240307` | `anthropic.claude-3-haiku-20240307-v1:0` | 빠른/저비용 처리 (⚠️ 모델 EOL 일정은 Bedrock 콘솔에서 확인하고, 후속 모델로 alias를 갱신할 것) |
+
+> **Alias ≠ 서빙 모델 ID**: 첫 행의 client alias(`...20241022`)와 실제 서빙 Bedrock Model ID(`...20240620-v1:0`)는 의도적으로 다르다. 왼쪽은 Claude Code CLI가 보내는 model 문자열이고, 오른쪽은 서울 in-region에서 실제 응답하는 Sonnet 3.5다. CLI가 어떤 Sonnet alias를 보내든 in-region 모델로 매핑되도록 한 것.
 
 > **"OpenAI 계열"이 필요한 경우**: proprietary GPT(예: gpt-5.x)는 가중치가 비공개라 self-host가 불가능하다. 반면 open-weight **gpt-oss-20b / gpt-oss-120b**는 vLLM alias로 추가해 Seoul in-region으로 운영할 수 있다. Bedrock 경유 경로는 서울 in-region 제공 여부를 콘솔에서 확인 후 사용한다.
 
@@ -246,17 +248,29 @@ scripts/warmup-request.sh --alias all --duration 30m
 
   > 토큰 키 이름은 반드시 `token`. gated 모델(예: LLaMA 4 Scout)은 해당 HF 계정에서 라이선스 승인이 선행돼야 한다.
 
-### Deploy
+### Deploy (2-command)
+
+게이트웨이 데이터플레인의 핵심은 k8s가 **배포 후에** 띄우는 NLB(vLLM 6개 + Higress gateway)다. 그 DNS는 배포 시점에 알 수 없어 CDK 토큰으로 못 박으므로, **인프라 배포**와 **후처리 배선**을 두 명령으로 나눈다:
 
 ```bash
 npm install
+
+# [1] 인프라 — 전체 스택 배포 (~60-90분, EKS Auto Mode + 16 스택)
 AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
-# 전체 배포 ~60-90분 (EKS Auto Mode + 16 스택)
+
+# [2] 후처리 — NLB DNS 조회 → SmartRouter 재배선 → Higress 구성 적용
+./scripts/finalize-deploy.sh
 ```
 
-배포 후 alias별 vLLM NLB DNS를 `cdk.json` context의 `vllmEndpoints`에, Higress gateway NLB DNS를 `-c higressEndpoint=<NLB DNS>`에 기록 → `cdk deploy NctSmartRouterStack` 한 번 더 실행하고, `scripts/apply-higress.sh`로 provider/route/key-auth를 적용.
+`finalize-deploy.sh`가 다음을 한 번에 처리한다(복붙 0회):
 
-> **운영자 주의**: `cdk.json`의 `operatorRoleArns`·`vllmEndpoints`는 비어 있는 상태로 배포된다. break-glass kubectl용 role ARN은 `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'`로 넘기거나(또는 본인 `cdk.json`에 지정), 빈 값이면 코드가 그대로 처리한다.
+1. **NLB DNS 조회** — vLLM 6개 + Higress gateway NLB DNS를 `kubectl`로 조회해 `cdk.json` context(`vllmEndpoints`, `higressEndpoint`)에 기입 (`scripts/get-endpoints.sh --write-context`).
+2. **SmartRouter 재배선** — `cdk deploy NctSmartRouterStack -c higressEndpoint=<조회값>`으로 upstream을 Higress gateway NLB로 연결.
+3. **Higress 구성 적용** — provider/route/key-auth consumer를 console REST로 적용 (`scripts/apply-higress.sh`). **첫 배포라 console admin이 없으면 `/system/init`로 자동 부트스트랩**(admin PW = gateway master-key로 고정, 이후 Secrets Manager로 복구 가능).
+
+완료되면 진입점(`https://gateway.nct-gateway.internal`)·master-key 조회법·테스트 클라이언트 체험법을 배너로 출력한다. 재실행은 멱등(NLB 재조회 → SmartRouter no-op → Higress upsert).
+
+> **운영자 주의**: `cdk.json`의 `operatorRoleArns`는 비어 있는 상태로 배포된다(`vllmEndpoints`·`higressEndpoint`는 `finalize-deploy.sh`가 채운다). break-glass kubectl용 role ARN은 `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'`로 넘기거나(또는 본인 `cdk.json`에 지정), 빈 값이면 코드가 그대로 처리한다.
 
 ### 단계별 배포 (권장)
 
@@ -272,6 +286,9 @@ cdk deploy NctVllm-Coding
 #   (NctHigressStack의 Helm release·NLB는 NctEksStack에 렌더되므로 NctEksStack도 함께 재배포)
 cdk deploy NctCertStack NctEksStack NctHigressStack NctSmartRouterStack \
            NctWarmupStack NctReservationStack NctAdminConsoleStack NctDnsStack
+
+# 후처리: NLB DNS 조회 → SmartRouter 재배선 → Higress 구성 적용
+./scripts/finalize-deploy.sh
 ```
 
 ---

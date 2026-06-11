@@ -24,14 +24,14 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 | Bedrock Claude 3.5 Sonnet (`2024-10-22`) | ≈ 49% | ≈ 55% |
 | **This CDK's `coding` = Qwen3.5-27B (self-hosted)** | **≈ 72.4%** | **≈ 82%** |
 
-**The message.** The common assumption — *"NCT traps us in Seoul, so we're stuck with a model at 37% of frontier"* — is flipped by this **1-click CDK solution** into *"keep \~80% of frontier in-region in Seoul while staying NCT-compliant on AWS."* Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Bedrock (Seoul) or to self-hosted open-source vLLM. It is not frontier-100%, but \~80% covers most real work — and, critically, it **never breaks data sovereignty.**
+**The message.** The common assumption — *"NCT traps us in Seoul, so we're stuck with a model at 37% of frontier"* — is flipped by this **2-command CDK solution** (`cdk deploy --all` → `finalize-deploy.sh`) into *"keep \~80% of frontier in-region in Seoul while staying NCT-compliant on AWS."* Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Bedrock (Seoul) or to self-hosted open-source vLLM. It is not frontier-100%, but \~80% covers most real work — and, critically, it **never breaks data sovereignty.**
 
 > See [How much performance do you give up?](#how-much-performance-do-you-give-up--position-vs-frontier-verified-2026-06) below for the underlying numbers, caveats, and higher-fidelity options (e.g. Qwen3.5-397B). Benchmarks vary by harness/config — **run a PoC on your real workload before adopting.**
 
 ---
 
 - **Region pinned**: `ap-northeast-2` (Seoul) — hardcoded in source (supports NCT requirements)
-- **Stacks**: 16 CDK stacks
+- **Stacks**: 16 CDK stacks (17 with the optional test client)
 - **Models served**: 6 vLLM (scale-to-zero) + 2 Bedrock (ON_DEMAND, IN_REGION)
 - **Endpoints**: HTTPS 443, Route 53 Private Hosted Zone (`*.nct-gateway.internal`)
 
@@ -121,6 +121,8 @@ Comparing the current `coding` alias (**Qwen3.5-27B**) against the frontier ceil
 |-------|------------------|-----|
 | `claude-3-5-sonnet-20241022` | `anthropic.claude-3-5-sonnet-20240620-v1:0` | Default target for Claude Code CLI |
 | `claude-3-haiku-20240307` | `anthropic.claude-3-haiku-20240307-v1:0` | Fast / low-cost (⚠️ check model EOL in the Bedrock console and update the alias to a successor) |
+
+> **Alias ≠ served model ID**: in the first row the client alias (`...20241022`) and the actually-served Bedrock Model ID (`...20240620-v1:0`) intentionally differ. The left is the model string Claude Code CLI sends; the right is the Sonnet 3.5 that actually answers in-region in Seoul. This maps whichever Sonnet alias the CLI sends to the in-region model.
 
 > **If you need an "OpenAI-family" model**: proprietary GPT (e.g. gpt-5.x) has closed weights and cannot be self-hosted. Open-weight **gpt-oss-20b / gpt-oss-120b**, however, can be added as vLLM aliases and run in-region in Seoul. For a Bedrock path, confirm Seoul in-region availability in the console first.
 
@@ -248,17 +250,29 @@ scripts/warmup-request.sh --alias all --duration 30m
 
   > The token key must be named `token`. Gated models (e.g. LLaMA 4 Scout) require prior license approval on the same HF account.
 
-### Deploy
+### Deploy (2-command)
+
+The crux of the gateway data plane is the NLBs that k8s provisions **after** deploy (6 vLLM + the Higress gateway). Their DNS is unknown at synth time and can't be hardcoded with a CDK token, so **infrastructure** and **post-deploy wiring** split into two commands:
 
 ```bash
 npm install
+
+# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 16 stacks)
 AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
-# Full deploy ~60-90 min (EKS Auto Mode + 16 stacks)
+
+# [2] Post-deploy — discover NLB DNS → rewire SmartRouter → apply Higress config
+./scripts/finalize-deploy.sh
 ```
 
-After deploy, record each alias's vLLM NLB DNS in the `vllmEndpoints` context of `cdk.json` and the Higress gateway NLB DNS as `-c higressEndpoint=<NLB DNS>`, then run `cdk deploy NctSmartRouterStack` once more and apply provider/route/key-auth config with `scripts/apply-higress.sh`.
+`finalize-deploy.sh` handles the rest in one shot (zero copy-paste):
 
-> **Operators**: `operatorRoleArns` and `vllmEndpoints` in `cdk.json` ship empty. Pass your own break-glass role ARN(s) via `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'` (or set them in your own `cdk.json`); the app handles empty values.
+1. **Discover NLB DNS** — looks up the 6 vLLM + Higress gateway NLB DNS via `kubectl` and writes them into the `cdk.json` context (`vllmEndpoints`, `higressEndpoint`) — `scripts/get-endpoints.sh --write-context`.
+2. **Rewire SmartRouter** — `cdk deploy NctSmartRouterStack -c higressEndpoint=<discovered>` points the upstream at the Higress gateway NLB.
+3. **Apply Higress config** — provider/route/key-auth consumer via the console REST API (`scripts/apply-higress.sh`). **On a first deploy with no console admin yet, it auto-bootstraps via `/system/init`** (admin PW fixed to the gateway master-key, recoverable from Secrets Manager afterward).
+
+On completion it prints a banner with the entry point (`https://gateway.nct-gateway.internal`), how to fetch the master-key, and how to try the test client. Re-running is idempotent (re-discover NLB DNS → SmartRouter no-op → Higress upsert).
+
+> **Operators**: `operatorRoleArns` in `cdk.json` ships empty (`vllmEndpoints`/`higressEndpoint` are filled by `finalize-deploy.sh`). Pass your own break-glass role ARN(s) via `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'` (or set them in your own `cdk.json`); the app handles empty values.
 
 ### Phased deploy (recommended)
 
@@ -274,6 +288,9 @@ cdk deploy NctVllm-Coding
 #   (NctHigressStack's Helm release/NLB render into NctEksStack, so redeploy NctEksStack too)
 cdk deploy NctCertStack NctEksStack NctHigressStack NctSmartRouterStack \
            NctWarmupStack NctReservationStack NctAdminConsoleStack NctDnsStack
+
+# Post-deploy: discover NLB DNS → rewire SmartRouter → apply Higress config
+./scripts/finalize-deploy.sh
 ```
 
 ---

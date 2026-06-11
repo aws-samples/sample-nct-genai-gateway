@@ -138,29 +138,73 @@ if [[ -z "$CONSOLE_URL" ]]; then
 fi
 log "console: $CONSOLE_URL"
 
-# ── 5. admin 로그인 (chart-managed Secret 에서 자격 조회) ───────────────────────
-# 첫 배포면 /system/init 로 admin 생성이 필요할 수 있으나, 헬름 차트는 console Secret
-# (adminUsername/adminPassword)을 미리 만든다 → 그 값으로 /session/login.
-log "admin 자격 조회 (k8s Secret $CONSOLE_SECRET)"
-ADMIN_USER=$(kubectl get secret -n "$NAMESPACE" "$CONSOLE_SECRET" \
-  -o jsonpath='{.data.adminUsername}' 2>/dev/null | base64 -d || echo "admin")
-ADMIN_PASS=$(kubectl get secret -n "$NAMESPACE" "$CONSOLE_SECRET" \
-  -o jsonpath='{.data.adminPassword}' 2>/dev/null | base64 -d || echo "")
-if [[ -z "$ADMIN_PASS" ]]; then
-  echo "⚠  console admin password 를 찾지 못했습니다 ($CONSOLE_SECRET)." >&2
-  echo "   첫 배포라면 console UI 또는 /system/init 로 admin 을 먼저 생성하세요." >&2
-  exit 1
-fi
+# ── 5. console 세션 확보 (필요 시 첫 배포 admin 부트스트랩 자동) ─────────────────
+# 정상 배포본은 console admin creds 를 `higress-console` k8s Secret 에 평문으로 보관한다.
+# 하지만 fresh Helm Higress 는 system.initialized=false + 그 Secret 이 비어 있다 →
+# 그땐 /system/init 로 admin 을 만들고 /user/changePassword 로 정식 PW 를 박으면 console
+# 이 creds 를 Secret 에 자동 기입한다(이후 재실행은 Secret 의 값으로 그냥 로그인).
+# console admin PW = gateway master-key(.key) 로 고정 → Secrets Manager 로 항상 복구 가능.
+CONSOLE_USER="admin"
+CONSOLE_FINAL_PW="$GATEWAY_API_KEY"                # 최종 PW = master-key (복구 가능)
+CONSOLE_INIT_PW="Init${GATEWAY_API_KEY:0:20}"      # 부트스트랩 임시 PW (alphanumeric, ≠ final)
 
 COOKIES=$(mktemp)
 trap 'rm -f "$COOKIES"; cleanup' EXIT
-log "로그인: $ADMIN_USER"
-LOGIN_CODE=$(curl -s -c "$COOKIES" -o /dev/null -w '%{http_code}' \
-  -X POST "$CONSOLE_URL/session/login" \
-  -H 'Content-Type: application/json' \
-  -d "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{username:$u,password:$p}')")
-if [[ "$LOGIN_CODE" != "200" && "$LOGIN_CODE" != "201" ]]; then
-  echo "⚠  로그인 실패 (HTTP $LOGIN_CODE)." >&2
+
+# console 로그인 (지정 PW). HTTP code 를 stdout 으로 반환 (200/201 = 성공).
+console_login() {
+  local pw="$1"
+  curl -s -c "$COOKIES" -o /dev/null -w '%{http_code}' \
+    -X POST "$CONSOLE_URL/session/login" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg u "$CONSOLE_USER" --arg p "$pw" '{username:$u,password:$p}')" \
+    || echo "000"
+}
+
+SESSION_OK=false
+
+# 1) Secret 에 admin PW 가 있으면 그걸로 로그인 (정상 배포본 / 재실행 경로)
+SECRET_PASS=$(kubectl get secret -n "$NAMESPACE" "$CONSOLE_SECRET" \
+  -o jsonpath='{.data.adminPassword}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+if [[ -n "$SECRET_PASS" ]]; then
+  log "console 로그인 (k8s Secret $CONSOLE_SECRET 의 admin creds)"
+  [[ "$(console_login "$SECRET_PASS")" =~ ^20[01]$ ]] && SESSION_OK=true
+fi
+
+# 2) 로그인 못 했으면 첫 배포로 보고 /system/init → changePassword 부트스트랩 (멱등)
+if [[ "$SESSION_OK" != "true" ]]; then
+  log "console 미초기화로 판단 → /system/init 부트스트랩"
+  INIT_CODE=$(curl -s -o /tmp/apply-higress-init.json -w '%{http_code}' \
+    -X POST "$CONSOLE_URL/system/init" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg u "$CONSOLE_USER" --arg p "$CONSOLE_INIT_PW" \
+            '{adminUser:{name:$u,displayName:$u,password:$p}}')" || echo "000")
+
+  if [[ "$INIT_CODE" =~ ^20[01]$ ]]; then
+    log "/system/init OK → 임시 PW 로그인 → 정식 PW(master-key)로 변경"
+    if [[ ! "$(console_login "$CONSOLE_INIT_PW")" =~ ^20[01]$ ]]; then
+      echo "⚠  init 직후 임시 PW 로그인 실패." >&2; exit 1
+    fi
+    CP_CODE=$(curl -s -b "$COOKIES" -o /tmp/apply-higress-cp.json -w '%{http_code}' \
+      -X POST "$CONSOLE_URL/user/changePassword" -H 'Content-Type: application/json' \
+      -d "$(jq -nc --arg o "$CONSOLE_INIT_PW" --arg n "$CONSOLE_FINAL_PW" \
+              '{oldPassword:$o,newPassword:$n}')" || echo "000")
+    if [[ ! "$CP_CODE" =~ ^20[01]$ ]]; then
+      echo "⚠  changePassword 실패 (HTTP $CP_CODE)." >&2; exit 1
+    fi
+    if [[ ! "$(console_login "$CONSOLE_FINAL_PW")" =~ ^20[01]$ ]]; then
+      echo "⚠  정식 PW 재로그인 실패." >&2; exit 1
+    fi
+    SESSION_OK=true
+  else
+    # init 실패(이미 초기화됐을 수 있음) → 최종 PW(master-key)로 마지막 로그인 시도
+    log "/system/init HTTP $INIT_CODE — 이미 초기화 가정, master-key 로 로그인 재시도"
+    [[ "$(console_login "$CONSOLE_FINAL_PW")" =~ ^20[01]$ ]] && SESSION_OK=true
+  fi
+fi
+
+if [[ "$SESSION_OK" != "true" ]]; then
+  echo "⚠  console 세션을 확보하지 못했습니다 ($CONSOLE_URL)." >&2
+  echo "   k8s Secret $CONSOLE_SECRET 의 adminPassword 또는 console 상태를 점검하세요." >&2
   exit 1
 fi
 
