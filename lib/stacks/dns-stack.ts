@@ -11,8 +11,6 @@ export interface DnsStackProps extends cdk.StackProps {
   zoneName: string;
   /** ALB for gateway.{zoneName} → Smart Router (preferred entry point) */
   smartRouterAlb: elbv2.IApplicationLoadBalancer;
-  /** ALB for litellm.{zoneName} → LiteLLM (direct access) */
-  litellmAlb: elbv2.IApplicationLoadBalancer;
   /** ALB for admin.{zoneName} → Admin Console */
   adminAlb?: elbv2.IApplicationLoadBalancer;
 }
@@ -20,8 +18,6 @@ export interface DnsStackProps extends cdk.StackProps {
 export class DnsStack extends cdk.Stack {
   /** e.g. 'https://gateway.nct-gateway.internal' */
   public readonly gatewayUrl: string;
-  /** e.g. 'https://litellm.nct-gateway.internal' */
-  public readonly litellmUrl: string;
 
   constructor(scope: Construct, id: string, props: DnsStackProps) {
     super(scope, id, props);
@@ -41,15 +37,6 @@ export class DnsStack extends cdk.Stack {
       ),
     });
 
-    // litellm.nct-gateway.internal → LiteLLM ALB (port 443, direct access)
-    new route53.ARecord(this, 'LitellmRecord', {
-      zone,
-      recordName: 'litellm',
-      target: route53.RecordTarget.fromAlias(
-        new route53_targets.LoadBalancerTarget(props.litellmAlb),
-      ),
-    });
-
     if (props.adminAlb) {
       new route53.ARecord(this, 'AdminRecord', {
         zone,
@@ -61,15 +48,10 @@ export class DnsStack extends cdk.Stack {
     }
 
     this.gatewayUrl = `https://gateway.${props.zoneName}`;
-    this.litellmUrl = `https://litellm.${props.zoneName}`;
 
     new cdk.CfnOutput(this, 'GatewayUrl', {
       value: this.gatewayUrl,
       description: 'Set as ANTHROPIC_BASE_URL in Claude Code (routes via Smart Router)',
-    });
-    new cdk.CfnOutput(this, 'LiteLLMUrl', {
-      value: this.litellmUrl,
-      description: 'Direct LiteLLM access (bypass Smart Router)',
     });
     new cdk.CfnOutput(this, 'AdminUrl', {
       value: `https://admin.${props.zoneName}`,

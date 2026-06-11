@@ -45,7 +45,7 @@ export class VllmStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'ModelAlias', {
       value: props.model.alias,
-      description: 'LiteLLM alias for this model',
+      description: 'Scenario alias for this model (client model field)',
     });
     new cdk.CfnOutput(this, 'ServingName', {
       value: props.model.servingName,

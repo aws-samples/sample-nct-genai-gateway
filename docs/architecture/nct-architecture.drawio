@@ -60,7 +60,7 @@
         <mxCell id="v_dx" parent="g_vpc" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=#945DF2;gradientDirection=north;fillColor=#5A30B5;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.direct_connect;" value="Direct Connect / VPN" vertex="1">
           <mxGeometry height="78" width="78" x="430" y="-235" as="geometry" />
         </mxCell>
-        <mxCell id="v_litellm" parent="g_vpc" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=#F78E04;gradientDirection=north;fillColor=#D05C17;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.ecs;" value="LiteLLM Proxy (ECS Fargate) ALB 443&lt;br&gt;6 vLLM + 2 Bedrock alias" vertex="1">
+        <mxCell id="v_litellm" parent="g_vpc" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=#F78E04;gradientDirection=north;fillColor=#D05C17;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.eks;" value="Higress AI Gateway (EKS) NLB 443&lt;br&gt;6 vLLM + 2 Bedrock provider&lt;br&gt;Anthropic↔OpenAI 변환·key-auth" vertex="1">
           <mxGeometry height="78" width="78" x="340" y="415" as="geometry" />
         </mxCell>
         <mxCell id="v_acm" parent="g_vpc" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=#F54749;gradientDirection=north;fillColor=#C7131F;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.certificate_manager;" value="ACM self-signed wildcard cert" vertex="1">
@@ -75,7 +75,7 @@
         <mxCell id="16" edge="1" parent="g_vpc" source="v_dx" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#232F3E;strokeWidth=2;fontSize=10;" target="v_r53" value="">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="17" edge="1" parent="g_vpc" source="v_r53" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#232F3E;strokeWidth=2;fontSize=10;" target="v_sr" value="gateway. / litellm. / admin. → Internal ALB">
+        <mxCell id="17" edge="1" parent="g_vpc" source="v_r53" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#232F3E;strokeWidth=2;fontSize=10;" target="v_sr" value="gateway. / admin. → Internal ALB">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="18" edge="1" parent="g_vpc" source="v_sr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#232F3E;strokeWidth=2;fontSize=10;" target="v_litellm" value="Anthropic Messages API&lt;br&gt;(alias → coding/math/ocr...)">
@@ -104,7 +104,7 @@
         <mxCell id="v_user" parent="g_vpc" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#232F3D;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;pointerEvents=1;shape=mxgraph.aws4.user;" value="&lt;span style=&quot;background-color: light-dark(#ffffff, var(--ge-dark-color, #121212));&quot;&gt;연구원 PC (내부망) HTTPS 443&lt;/span&gt;" vertex="1">
           <mxGeometry height="78" width="78" x="429" y="-385" as="geometry" />
         </mxCell>
-        <mxCell id="20" edge="1" parent="1" source="v_litellm" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#232F3E;strokeWidth=2;fontSize=10;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" target="v_bedrock" value="Bedrock fallback (Pod Identity / IAM)">
+        <mxCell id="20" edge="1" parent="1" source="v_sr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;strokeColor=#116D5B;strokeWidth=2;fontSize=10;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" target="v_bedrock" value="cold/error 시 Bedrock-direct fallback&lt;br&gt;(boto3, ECS task role, gateway 우회)">
           <mxGeometry relative="1" as="geometry">
             <Array as="points" />
           </mxGeometry>

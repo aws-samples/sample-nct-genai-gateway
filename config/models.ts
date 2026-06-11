@@ -3,7 +3,7 @@ export interface VllmModelConfig {
   modelId: string;
   /** K8s serving name — used as Deployment name and NLB service name */
   servingName: string;
-  /** Scenario alias — primary LiteLLM alias (e.g. 'coding', 'ocr') */
+  /** Scenario alias — primary client-facing model name (e.g. 'coding', 'ocr') */
   alias: string;
   /** EC2 instance type for Karpenter NodePool selection */
   instanceType: string;
@@ -24,7 +24,7 @@ export interface VllmModelConfig {
   maxReplicas: number;
   /** Mount EFS model cache at /model-cache */
   efsEnabled: boolean;
-  /** Additional LiteLLM aliases beyond the primary alias */
+  /** Additional client-facing aliases beyond the primary alias */
   extraAliases?: string[];
   /** Extra vLLM CLI flags appended after the standard args */
   extraArgs?: string[];
@@ -47,11 +47,20 @@ export const VLLM_MODELS: Record<string, VllmModelConfig> = {
     gpuCount: 4,
     tensorParallelSize: 4,
     maxModelLen: 32768,
-    vllmImageTag: 'latest',
+    vllmImageTag: 'v0.20.2',
     enableVision: true,
     minReplicas: 0,
     maxReplicas: 3,
     efsEnabled: true,
+    // Tool calling: vLLM rejects `tool_choice:"auto"` with 400 unless both flags are set.
+    // Qwen3.5-27B emits XML-style tool calls (<tool_call><function=...><parameter=...>),
+    // so the matching vLLM parser is `qwen3_xml` (verified against the live v0.20.2 parser
+    // registry and observed output — `hermes` expects JSON-in-<tool_call> and silently
+    // leaks the XML as plain text). Without these, warm tool-use requests 400 at vLLM and
+    // the SmartRouter reactive safety-net answers them via Bedrock — correct but not
+    // vLLM-direct. (No --reasoning-parser: keeps the response shape identical to the warm
+    // non-stream/stream paths already validated.)
+    extraArgs: ['--enable-auto-tool-choice', '--tool-call-parser', 'qwen3_xml'],
   },
   video: {
     // Qwen3.5-27B: MMMU 85.0, native video understanding — separate instance for fault isolation
@@ -62,11 +71,13 @@ export const VLLM_MODELS: Record<string, VllmModelConfig> = {
     gpuCount: 4,
     tensorParallelSize: 4,
     maxModelLen: 32768,
-    vllmImageTag: 'latest',
+    vllmImageTag: 'v0.20.2',
     enableVision: true,
     minReplicas: 0,
     maxReplicas: 2,
     efsEnabled: true,
+    // Same Qwen3.5-27B as `coding` — enable qwen3_xml tool calling here too for parity.
+    extraArgs: ['--enable-auto-tool-choice', '--tool-call-parser', 'qwen3_xml'],
   },
   ocr: {
     // InternVL3-14B: DocVQA 94.1, OCRBench 875 — document/diagram OCR
@@ -77,7 +88,7 @@ export const VLLM_MODELS: Record<string, VllmModelConfig> = {
     gpuCount: 4,
     tensorParallelSize: 4,
     maxModelLen: 8192,
-    vllmImageTag: 'latest',
+    vllmImageTag: 'v0.20.2',
     enableVision: true,
     minReplicas: 0,
     maxReplicas: 2,
@@ -94,7 +105,7 @@ export const VLLM_MODELS: Record<string, VllmModelConfig> = {
     gpuCount: 8,
     tensorParallelSize: 8,
     maxModelLen: 131072,
-    vllmImageTag: 'latest',
+    vllmImageTag: 'v0.20.2',
     enableVision: true,
     minReplicas: 0,
     maxReplicas: 1,
@@ -115,7 +126,7 @@ export const VLLM_MODELS: Record<string, VllmModelConfig> = {
     gpuCount: 4,
     tensorParallelSize: 4,
     maxModelLen: 32768,
-    vllmImageTag: 'latest',
+    vllmImageTag: 'v0.20.2',
     enableVision: false,
     minReplicas: 0,
     maxReplicas: 2,
@@ -131,7 +142,7 @@ export const VLLM_MODELS: Record<string, VllmModelConfig> = {
     instanceType: 'g5.xlarge',
     gpuCount: 1,
     maxModelLen: 16384,
-    vllmImageTag: 'latest',
+    vllmImageTag: 'v0.20.2',
     enableVision: true,
     enableAudio: true,
     minReplicas: 0,
@@ -143,7 +154,7 @@ export const VLLM_MODELS: Record<string, VllmModelConfig> = {
 
 /** Bedrock ON_DEMAND Seoul (NCT compliant) — Fallback + Claude Code CLI compat */
 export interface BedrockModelConfig {
-  /** LiteLLM alias exposed to clients */
+  /** Client-facing alias exposed to clients (model field) */
   modelName: string;
   /** Bedrock model ID — Seoul IN_REGION only */
   bedrockModelId: string;
@@ -166,5 +177,11 @@ export const BEDROCK_MODELS: BedrockModelConfig[] = [
 ];
 
 export const DEFAULT_VLLM_IMAGE = 'vllm/vllm-openai';
-// v0.10.2 does not support qwen3_5/gemma4/llama4 architectures — use latest
-export const DEFAULT_VLLM_TAG = 'latest';
+// Pinned, NOT `latest`. v0.10.2 is too old for qwen3.5/gemma4/llama4 architectures
+// (need v0.20.0+); v0.20.2 is the version validated end-to-end against Mountpoint-for-S3
+// model caching. `latest` is a floating tag: a newer huggingface_hub baked into a later
+// `latest` image switched to a download path that RENAMEs staged files, which S3 FUSE
+// rejects (ENOSYS / Errno 38) — the init container then crash-loops forever while its GPU
+// node keeps billing. Pin the tag so deploys stay reproducible; bump deliberately after
+// re-validating S3 model download.
+export const DEFAULT_VLLM_TAG = 'v0.20.2';

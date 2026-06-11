@@ -13,8 +13,10 @@ export interface VllmDeploymentProps {
    */
   vllmNamespaceManifest: IDependable;
   /**
-   * Expose vLLM via an Internal NLB so ECS Fargate (LiteLLM) can reach it.
-   * ECS tasks cannot resolve K8s ClusterIP — NLB DNS is required.
+   * Expose vLLM via an Internal NLB so out-of-cluster callers can reach it: the
+   * Higress AI Gateway providers point at this NLB DNS, and the SmartRouter ECS task
+   * probes its /health for the cold-vLLM pre-flight. ECS tasks (and the gateway
+   * provider config) cannot resolve K8s ClusterIP — a stable NLB DNS is required.
    */
   exposeNlb?: boolean;
   /**
@@ -177,7 +179,16 @@ export class VllmDeployment extends Construct {
             // Each PVC has prefix models/<servingName>/ so files land at s3://bucket/models/<name>/<files>.
             // Delete .cache dir first to avoid stale .incomplete files from previous pods.
             // S3 Mountpoint cannot re-open existing remote inodes for append — fresh start is required.
-            // snapshot_download is idempotent: skips files that already exist with matching hash.
+            //
+            // IDEMPOTENT GUARD (fool-proof): if weights are already present in the cache
+            // (config.json + at least one *.safetensors/*.bin shard), skip the download
+            // entirely. This (a) makes re-deploys / warm restarts near-instant, and
+            // (b) sidesteps a hard failure mode of newer huggingface_hub on Mountpoint-for-S3:
+            // it stages files as `.incomplete` then RENAMEs to the final name, but S3 FUSE
+            // returns ENOSYS (Errno 38) for rename — the init container then crash-loops and
+            // never starts, while the GPU node it pulled stays up and bills indefinitely.
+            // The pinned image tag (config/models.ts, NOT `latest`) keeps fresh downloads on a
+            // huggingface_hub version known to work with Mountpoint-for-S3.
             ...(props.modelCacheBucketName ? {
               initContainers: [
                 {
@@ -185,25 +196,25 @@ export class VllmDeployment extends Construct {
                   image: `${DEFAULT_VLLM_IMAGE}:${imageTag}`,
                   command: ['sh', '-c'],
                   args: [
-                    // Delete stale .cache from previous pods, then download flat to /model-cache.
-                    // HF Hub temp .incomplete files go to /model-cache/.cache — cleaned on each run.
-                    // Completed model files are written directly (no .incomplete needed on success).
-                    // Download model weights to /model-cache (= S3 prefix root for this PVC).
-                    // HUGGINGFACE_HUB_VERBOSITY=warning: suppress non-fatal chmod warnings.
                     // HF_HUB_DISABLE_XET=1: disable Xet protocol (uses random write access,
                     //   incompatible with S3 FUSE which only supports sequential writes).
                     // max_workers=1: serialize downloads to avoid concurrent .incomplete file conflicts.
                     // rm -rf .cache: clean temp files before/after download.
                     [
-                      `rm -rf /model-cache/.cache`,
-                      `&& HF_HUB_DISABLE_XET=1`,
-                      `python3 -c`,
+                      `if [ -f /model-cache/config.json ]`,
+                      `&& { ls /model-cache/*.safetensors >/dev/null 2>&1`,
+                      `|| ls /model-cache/*.bin >/dev/null 2>&1; }; then`,
+                      `echo "Model weights already present in /model-cache — skipping download.";`,
+                      `else`,
+                      `rm -rf /model-cache/.cache;`,
+                      `HF_HUB_DISABLE_XET=1 python3 -c`,
                       `"from huggingface_hub import snapshot_download;`,
                       `snapshot_download(repo_id='${model.modelId}',`,
                       `local_dir='/model-cache',`,
                       `local_dir_use_symlinks=False,`,
-                      `max_workers=1)"`,
-                      `&& rm -rf /model-cache/.cache`,
+                      `max_workers=1)";`,
+                      `rm -rf /model-cache/.cache;`,
+                      `fi`,
                     ].join(' '),
                   ],
                   env: [
@@ -324,7 +335,7 @@ export class VllmDeployment extends Construct {
     });
     svcManifest.node.addDependency(props.vllmNamespaceManifest);
 
-    // Internal NLB: required for ECS Fargate (LiteLLM) to reach vLLM across VPC
+    // Internal NLB: stable DNS for out-of-cluster callers — Higress providers + SmartRouter pre-flight
     if (props.exposeNlb ?? true) {
       const nlbSvcManifest = props.cluster.addManifest(`${id}NlbService`, {
         apiVersion: 'v1',

@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # Phase 7: Smart Router E2E validation
+#
+# SmartRouter는 게이트웨이 진입점이다. `general` alias 요청을 prompt 분석으로
+# scenario alias(coding/math/longcontext...)에 라우팅하고, 명시적 alias는 그대로 통과시킨다.
+# Anthropic Messages API(/v1/messages, x-api-key 마스터 키)로 호출한다.
 set -euo pipefail
-
-# Get LiteLLM endpoint from CloudFormation output
-LITELLM_ENDPOINT=$(aws cloudformation describe-stacks \
-  --stack-name NctLiteLLMStack --region ap-northeast-2 \
-  --query 'Stacks[0].Outputs[?OutputKey==`LiteLLMEndpoint`].OutputValue' \
-  --output text)
 
 # Get Smart Router endpoint from CloudFormation output
 ROUTER_ENDPOINT=$(aws cloudformation describe-stacks \
@@ -15,13 +13,12 @@ ROUTER_ENDPOINT=$(aws cloudformation describe-stacks \
   --output text)
 
 echo "=== Phase 7: Smart Router Validation ==="
-echo "LiteLLM  : $LITELLM_ENDPOINT"
 echo "Router   : $ROUTER_ENDPOINT"
 echo ""
 
-# Get LiteLLM key
+# Get gateway master key
 KEY=$(aws secretsmanager get-secret-value \
-  --secret-id "/nct/litellm/master-key" \
+  --secret-id "/nct/higress/master-key" \
   --region ap-northeast-2 \
   --query SecretString --output text | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
 
@@ -35,15 +32,16 @@ run_test() {
   echo "--- TEST: $label ---"
   echo "  Model: $model | Expected routing: $expected_scenario"
 
-  RESP=$(curl -s -X POST "$endpoint/v1/chat/completions" \
+  RESP=$(curl -sk -X POST "$endpoint/v1/messages" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $KEY" \
-    -d "{\"model\": \"$model\", \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}], \"max_tokens\": 100}")
+    -H "anthropic-version: 2023-06-01" \
+    -H "x-api-key: $KEY" \
+    -d "{\"model\": \"$model\", \"max_tokens\": 100, \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}]}")
 
   ACTUAL_MODEL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('model','?'))" 2>/dev/null || echo "ERROR")
   echo "  Actual model used: $ACTUAL_MODEL"
 
-  if echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'choices' in d" 2>/dev/null; then
+  if echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'content' in d" 2>/dev/null; then
     echo "  ✅ PASS"
   else
     echo "  ❌ FAIL: $RESP"
@@ -53,7 +51,7 @@ run_test() {
 
 # 1. Health check
 echo "--- Health check ---"
-curl -sf "$ROUTER_ENDPOINT/health/liveliness" && echo " ✅ Router healthy" || echo " ❌ Router unhealthy"
+curl -skf "$ROUTER_ENDPOINT/health/liveliness" && echo " ✅ Router healthy" || echo " ❌ Router unhealthy"
 echo ""
 
 # 2. Passthrough test (non-general alias — should bypass detection)
@@ -71,11 +69,12 @@ run_test "general → math detection" "$ROUTER_ENDPOINT" "general" \
 # 5. general → longcontext detection (long text)
 LONG_TEXT=$(python3 -c "print('This is a very long manufacturing document. ' * 2000)")
 echo "--- TEST: general → longcontext (${#LONG_TEXT} chars) ---"
-RESP=$(curl -s -X POST "$ROUTER_ENDPOINT/v1/chat/completions" \
+RESP=$(curl -sk -X POST "$ROUTER_ENDPOINT/v1/messages" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KEY" \
-  -d "{\"model\": \"general\", \"messages\": [{\"role\": \"user\", \"content\": \"$LONG_TEXT Summarize this.\"}], \"max_tokens\": 50}")
-echo "  Response snippet: $(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('choices',[{}])[0].get('message',{}).get('content','?')[:80])" 2>/dev/null)"
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-api-key: $KEY" \
+  -d "{\"model\": \"general\", \"max_tokens\": 50, \"messages\": [{\"role\": \"user\", \"content\": \"$LONG_TEXT Summarize this.\"}]}")
+echo "  Response snippet: $(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(''.join(b.get('text','') for b in d.get('content',[]))[:80])" 2>/dev/null)"
 echo ""
 
 echo "=== Phase 7 validation complete ==="

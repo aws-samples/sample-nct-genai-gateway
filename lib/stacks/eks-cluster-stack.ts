@@ -7,6 +7,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as cr from 'aws-cdk-lib/custom-resources';
 import { KubectlV32Layer } from '@aws-cdk/lambda-layer-kubectl-v32';
 import { Construct, IDependable } from 'constructs';
 
@@ -234,6 +235,36 @@ export class EksClusterStack extends cdk.Stack {
     const hfTokenSecretName = props.hfTokenSecretName ?? 'hf-token';
     const hfSecret = secretsmanager.Secret.fromSecretNameV2(this, 'HfTokenSecret', hfTokenSecretName);
     hfSecret.grantRead(vllmPodRole);
+
+    // Fool-proof: fail the deploy EARLY (here, before any GPU node is provisioned) if the
+    // hf-token secret is missing. fromSecretNameV2 is lazy — a wrong/absent secret is not
+    // caught at synth or deploy; the failure only surfaces at pod start, where the init
+    // container crash-loops on a FailedMount while the GPU node it triggered keeps billing.
+    // This DescribeSecret call runs during EksClusterStack deploy: if the secret does not
+    // exist, the SDK raises ResourceNotFoundException and the stack fails fast with a clear
+    // cause, instead of silently burning GPU. Pre-create the secret per the README:
+    //   aws secretsmanager create-secret --name hf-token \
+    //     --secret-string '{"token":"hf_xxx"}' --region ap-northeast-2
+    const hfSecretCheck = new cr.AwsCustomResource(this, 'HfTokenSecretCheck', {
+      onCreate: {
+        service: 'SecretsManager',
+        action: 'describeSecret',
+        parameters: { SecretId: hfTokenSecretName },
+        physicalResourceId: cr.PhysicalResourceId.of(`hf-token-check-${hfTokenSecretName}`),
+      },
+      onUpdate: {
+        service: 'SecretsManager',
+        action: 'describeSecret',
+        parameters: { SecretId: hfTokenSecretName },
+        physicalResourceId: cr.PhysicalResourceId.of(`hf-token-check-${hfTokenSecretName}`),
+      },
+      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
+        resources: cr.AwsCustomResourcePolicy.ANY_RESOURCE,
+      }),
+      installLatestAwsSdk: false,
+    });
+    // Order the SecretProviderClass after the check so a missing secret blocks the chain.
+    hfSecretCheck.node.addDependency(hfSecret);
 
     const vllmPodPia = new CfnPodIdentityAssociation(this, 'VllmPodPia', {
       clusterName: this.cluster.clusterName,

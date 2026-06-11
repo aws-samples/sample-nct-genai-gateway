@@ -43,9 +43,10 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 
 A researcher PC on the internal network reaches the gateway over Direct Connect / Site-to-Site VPN (HTTPS 443) →
 Route 53 Private Hosted Zone (`*.nct-gateway.internal`) → SmartRouter (ECS Fargate; analyzes and rewrites the prompt, Anthropic Messages API compatible) →
-LiteLLM Proxy (ECS Fargate; 6 vLLM + 2 Bedrock aliases) →
+Higress AI Gateway (EKS; Anthropic↔OpenAI conversion, key-auth, 6 vLLM + 2 Bedrock providers) →
 either **EKS Auto Mode** (vLLM × 6, scale-to-zero, Karpenter cpu/gpu/neuron, model cache on S3 Mountpoint CSI)
-or **Amazon Bedrock** (Seoul in-region fallback). A Reservation subsystem (EventBridge + Lambda + DynamoDB + Step Functions)
+or **Amazon Bedrock** (Seoul in-region fallback). When a vLLM alias is cold, SmartRouter detects it via a pre-flight and falls back directly to Bedrock (bypassing the gateway).
+A Reservation subsystem (EventBridge + Lambda + DynamoDB + Step Functions)
 drives vLLM warmup/cooldown on a weekday 08:30–19:30 KST schedule. The entire path stays within a single region (Seoul).
 
 > Editable source: [`docs/architecture/nct-architecture.drawio`](docs/architecture/nct-architecture.drawio) (draw.io)
@@ -66,7 +67,7 @@ drives vLLM warmup/cooldown on a weekday 08:30–19:30 KST schedule. The entire 
 | `NctVllm-Audio` | Phi-4 Multimodal (g5.xlarge, 1×A10G) |
 | `NctVllm-Longcontext` | LLaMA 4 Scout 17B-16E (g6e.48xlarge, 8×L40S) |
 | `NctCertStack` | Self-signed wildcard cert `*.nct-gateway.internal` → ACM + Secrets Manager (CA) |
-| `NctLiteLLMStack` | LiteLLM ECS Fargate, Internal ALB 443 |
+| `NctHigressStack` | Higress AI Gateway (EKS Helm) + Bedrock IAM user / consumer-key Secrets. The Helm release + internal NLB 443 render into `NctEksStack` |
 | `NctSmartRouterStack` | SmartRouter ECS Fargate, Internal ALB 443 |
 | `NctWarmupStack` | Step Functions (Warmup / Cooldown) |
 | `NctReservationStack` | DynamoDB reservation + reserve/expire Lambda + EventBridge |
@@ -129,8 +130,7 @@ Comparing the current `coding` alias (**Qwen3.5-27B**) against the frontier ceil
 
 | Purpose | URL | Backend |
 |---------|-----|---------|
-| Unified entry (recommended, Anthropic-compatible) | `https://gateway.nct-gateway.internal` | SmartRouter → LiteLLM |
-| LiteLLM direct (OpenAI API) | `https://litellm.nct-gateway.internal/v1/chat/completions` | LiteLLM |
+| Unified entry (Anthropic-compatible) | `https://gateway.nct-gateway.internal` | SmartRouter → Higress |
 | Admin Console (operators only) | `https://admin.nct-gateway.internal` | FastAPI |
 
 All use **Internal ALB + ACM (self-signed CA) + HTTPS 443**. Requires Direct Connect / Site-to-Site VPN.
@@ -170,10 +170,11 @@ curl https://gateway.nct-gateway.internal/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -d '{"model":"general","max_tokens":256,"messages":[...]}'
 
-# force a specific alias
-curl https://litellm.nct-gateway.internal/v1/chat/completions \
-  -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
-  -d '{"model":"coding","messages":[...]}'
+# force a specific alias (put the alias in the model field)
+curl https://gateway.nct-gateway.internal/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"coding","max_tokens":256,"messages":[...]}'
 ```
 
 ---
@@ -208,7 +209,7 @@ scripts/warmup-request.sh --alias all --duration 30m
   - Current replicas / node status per alias
   - Active reservations and remaining time
   - Manual warm-up / cool-down
-  - LiteLLM logs / Bedrock call stats (basic)
+  - Gateway logs / Bedrock call stats (basic)
 
 ---
 
@@ -236,6 +237,16 @@ scripts/warmup-request.sh --alias all --duration 30m
 - AWS CLI configured (`ap-northeast-2` credentials)
 - Node.js >= 18, `npm install -g aws-cdk`
 - CDK Bootstrap in `ap-northeast-2`
+- **HuggingFace token secret (required)** — used by vLLM pods to pull model weights. Create it in Secrets Manager before deploying. **If it is missing, vLLM pods fail to start (while the GPU node they triggered keeps billing) and `NctEksStack` deployment fails fast** — a deploy-time sanity check rejects an absent `hf-token`:
+
+  ```bash
+  aws secretsmanager create-secret \
+    --name hf-token \
+    --secret-string '{"token":"hf_xxxxxxxx"}' \
+    --region ap-northeast-2
+  ```
+
+  > The token key must be named `token`. Gated models (e.g. LLaMA 4 Scout) require prior license approval on the same HF account.
 
 ### Deploy
 
@@ -245,7 +256,7 @@ AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 # Full deploy ~60-90 min (EKS Auto Mode + 16 stacks)
 ```
 
-After deploy, record each alias's vLLM NLB DNS in the `vllmEndpoints` context of `cdk.json`, then run `cdk deploy NctLiteLLMStack` once more.
+After deploy, record each alias's vLLM NLB DNS in the `vllmEndpoints` context of `cdk.json` and the Higress gateway NLB DNS as `-c higressEndpoint=<NLB DNS>`, then run `cdk deploy NctSmartRouterStack` once more and apply provider/route/key-auth config with `scripts/apply-higress.sh`.
 
 > **Operators**: `operatorRoleArns` and `vllmEndpoints` in `cdk.json` ship empty. Pass your own break-glass role ARN(s) via `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'` (or set them in your own `cdk.json`); the app handles empty values.
 
@@ -259,10 +270,55 @@ cdk deploy NctNetworkStack NctEksStack NctKarpenterStack
 cdk deploy NctVllm-Coding
 # (add the rest after researcher feedback)
 
-# Phase 7-10: cert + LiteLLM + SmartRouter + Warmup + Reservation + Admin + DNS
-cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
+# Phase 7-10: cert + Higress + SmartRouter + Warmup + Reservation + Admin + DNS
+#   (NctHigressStack's Helm release/NLB render into NctEksStack, so redeploy NctEksStack too)
+cdk deploy NctCertStack NctEksStack NctHigressStack NctSmartRouterStack \
            NctWarmupStack NctReservationStack NctAdminConsoleStack NctDnsStack
 ```
+
+---
+
+## Try it: in-VPC test client (optional)
+
+To experience the gateway hands-on, you can deploy one test EC2 instance inside the VPC. It boots with Claude Code (the GenAI harness) pre-installed and wired to the gateway, reachable **only via SSM Session Manager** (no public IP, no SSH — it tunnels in over the SSM VPC endpoints).
+
+```bash
+# Enable via the option gate (off by default) — the 16 stacks + NctTestClientStack
+cdk deploy --all -c deployTestClient=true
+```
+
+The point is to **compare cold vs. warm with the same command**. The client pins one model (`general`); SmartRouter's automatic fallback handles the switch:
+
+```bash
+# 1) Connect over SSM (instance ID is an NctTestClientStack output)
+aws ssm start-session --target <instance-id> --region ap-northeast-2
+
+# Show the walkthrough
+nct-demo
+
+# 2) BEFORE warm-up (GPU cold): the vLLM alias has 0 replicas, so SmartRouter
+#    detects the cold alias and falls back directly to in-region Bedrock (Claude 3.5 Sonnet, Seoul)
+claude "Refactor this function for readability: ..."
+
+# 3) Warm up the GPU model (a few minutes; poll with nct-status)
+nct-warmup coding
+nct-status          # SUCCEEDED = ready
+
+# 4) AFTER warm-up: the SAME command now routes to self-hosted Qwen3.5-27B (vLLM)
+claude "Refactor this function for readability: ..."
+
+# 5) Stop GPU billing when done
+nct coding          # scale the alias back to zero replicas
+```
+
+| Helper | What it does |
+|--------|--------------|
+| `nct-warmup <alias>` | Spin up the alias's vLLM deployment (Warmup SFN) |
+| `nct-status` | Recent warm-up execution states (RUNNING→SUCCEEDED) |
+| `nct <alias>` | Scale the alias back to zero (Cooldown SFN) |
+| `nct-demo` | Print the walkthrough above |
+
+> **How the switch works**: the client always sends `ANTHROPIC_MODEL=general`. SmartRouter pre-flights the target alias's vLLM NLB `/health` (~2s) **before** calling Higress. If cold (0 healthy targets) it bypasses the gateway and falls back directly to Bedrock Seoul (boto3, native Anthropic Messages); if warm it goes the normal Higress→vLLM path. A reactive fallback (Bedrock-direct) is also kept as a safety net for gateway/vLLM errors. The same command compares both backends with no client-side code or model-name change.
 
 ---
 
@@ -283,13 +339,14 @@ cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
 - Karpenter provisions nodes on demand; vLLM init takes 5–35 min
 - Warm-up is orchestrated with Step Functions (up to 50 min timeout)
 
-### Smart Routing
+### Smart Routing & Bedrock-direct fallback
 - A `general` alias request is analyzed via prompt embedding → scenario detection → rewritten to `coding`/`math`/... model
-- Calling LiteLLM directly lets you target a scenario alias explicitly
+- Putting an alias directly in the `model` field makes SmartRouter pass it through (no scenario detection)
+- When a vLLM alias is cold, SmartRouter detects it via a pre-flight and falls back directly to Bedrock (native Anthropic Messages, boto3), bypassing the gateway. A reactive fallback also covers gateway/vLLM errors
 
-### LiteLLM `drop_params: true`
-- Claude Code sends Anthropic-only params (`thinking`, `betas`, `anthropic_version`)
-- vLLM doesn't understand them, so LiteLLM silently strips them before forwarding to the OpenAI endpoint
+### Higress Anthropic ↔ OpenAI conversion
+- Claude Code sends Anthropic-only params (`thinking`, `betas`, `anthropic_version`) to `/v1/messages`
+- The Higress AI Gateway natively converts Anthropic Messages to OpenAI Chat Completions for vLLM (OpenAI-compatible) and converts the response back to Anthropic form (replacing LiteLLM's `drop_params`/manual sanitize)
 
 ### Pod Identity > IRSA
 - Bedrock calls and S3 Mountpoint both use EKS Pod Identity
@@ -304,8 +361,9 @@ cdk deploy NctCertStack NctLiteLLMStack NctSmartRouterStack \
 |-----------|----------|----------|
 | EKS Control Plane | — | $0.10 |
 | Karpenter system nodes | m5.large | ~$0.10 |
-| LiteLLM / SmartRouter / Admin ECS | Fargate (0.5 vCPU × 3) | ~$0.10 |
-| ALB × 3 (Internal) | — | ~$0.07 |
+| SmartRouter / Admin ECS | Fargate (0.5 vCPU × 2) | ~$0.07 |
+| Higress (gateway/controller/console) | EKS pods (non-GPU nodes) | included in EKS node cost |
+| Internal LB × 3 (SmartRouter ALB + Admin ALB + Higress NLB) | — | ~$0.07 |
 | NAT GW | — | ~$0.05 |
 | S3 Storage (model cache) | ~500 GB | ~$0.02 |
 | **Always-on total** | | **\~$0.45/hr (\~$324/month)** |
@@ -341,19 +399,46 @@ kubectl scale deployment <servingName> -n vllm --replicas=0
 
 ### Logs
 - vLLM: `kubectl logs deploy/<servingName> -n vllm -f`
-- LiteLLM: CloudWatch Logs `/ecs/nct-litellm`
+- Higress: `kubectl logs deploy/higress-gateway -n higress-system -f`
 - SmartRouter: CloudWatch Logs `/ecs/nct-smart-router`
 - Admin Console: CloudWatch Logs `/ecs/nct-admin-console`
 - Warmup SFN: Step Functions console `NctWarmup`/`NctCooldown`
 
 ### Health checks
 ```bash
-# LiteLLM (callable without auth)
-curl https://litellm.nct-gateway.internal/health/liveliness   # → "I'm alive!"
+# SmartRouter (gateway entry point)
+curl https://gateway.nct-gateway.internal/health/liveliness
 
-# SmartRouter
-curl https://gateway.nct-gateway.internal/health
+# Higress gateway (in-cluster, via NLB DNS)
+kubectl exec -n vllm <curl-pod> -- curl -sk https://<higress-nlb>:443/
 ```
+
+---
+
+## Test Report
+
+Measured from an in-VPC client against the gateway entry point (`gateway.nct-gateway.internal`, Anthropic Messages API `/v1/messages`, `x-api-key` master key) on a deployed environment. All four core paths passed, and three corner cases found in operation were resolved.
+
+> ⚠️ This is a measured snapshot from one deployment. Model versions, benchmarks, and latency figures vary by environment and date — **reproduce in your own environment before adopting**.
+
+### E2E paths (4/4 PASS)
+
+| # | Scenario | Path | Result |
+|---|----------|------|--------|
+| 1 | **cold → Bedrock** | request while vLLM is scaled to zero → SmartRouter pre-flight detects cold → Bedrock-direct | HTTP 200, `x-nct-fallback: bedrock-direct`, `claude-3-5-sonnet` response |
+| 2 | **warm → vLLM (non-stream)** | vLLM warm → Higress → vLLM directly | HTTP 200, `model: qwen35-27b`, no fallback header |
+| 3 | **tool use → vLLM direct** | warm tool-call request handled by vLLM directly | HTTP 200, structured `tool_use` block, `stop_reason: tool_use`, no fallback |
+| 4 | **streaming → vLLM** | `stream:true` warm request | HTTP 200, `text/event-stream`, native Anthropic SSE (`message_start`→`content_block_delta`×N→`message_stop`) |
+
+### Resolved corner cases (3)
+
+| Symptom | Root cause | Fix |
+|---------|-----------|-----|
+| **~41 s latency on cold requests** | When a vLLM alias is scaled to zero its NLB has 0 targets → Envoy (Higress) hangs ~40 s on the dead upstream before returning 503 | SmartRouter pre-flights the alias's vLLM NLB `/health` (2 s timeout) **before** calling Higress. If cold, it bypasses the gateway and goes straight to Bedrock-direct → **41 s → ~2.5 s** |
+| **tool-call XML leaked as plain text** | `--tool-call-parser hermes` expects JSON-in-`<tool_call>`, but Qwen3.5-27B emits XML form (`<tool_call><function=...>`) → the parser misses it and the XML leaks as text | switched the parser to `qwen3_xml` (`coding`/`video` in `config/models.ts`) → handled by vLLM directly as a structured `tool_use` block |
+| **Bedrock `/v1/messages` SigV4 failure** | Higress ai-proxy 2.0.0 has no native Anthropic Messages support for Bedrock → a SigV4 scope error during the OpenAI-Chat→Bedrock-Converse double translation ([higress#3809]) | removed the gateway-level fallback. On a vLLM failure SmartRouter calls Bedrock's native `/v1/messages` **directly** via boto3 (gateway-bypassed) — Bedrock accepts the Anthropic body verbatim |
+
+[higress#3809]: https://github.com/alibaba/higress/issues/3809
 
 ---
 
@@ -362,7 +447,7 @@ curl https://gateway.nct-gateway.internal/health
 | # | Issue | Status |
 |---|-------|--------|
 | I1 | Bottlerocket + EFS TLS mount failure | Worked around with S3 Mountpoint (stable in operation) |
-| I8 | No per-researcher API keys | Single shared master key. To be split with LiteLLM virtual keys |
+| I8 | No per-researcher API keys | Single shared master key. To be split with Higress consumer key-auth (per-researcher consumers) |
 | — | Bedrock model EOL | Update the alias to a Seoul IN_REGION successor; check EOL dates in the Bedrock console |
 
 ---
@@ -381,7 +466,7 @@ cdk destroy --all --force
 ## Related
 
 - [vLLM docs](https://docs.vllm.ai)
-- [LiteLLM docs](https://docs.litellm.ai)
+- [Higress docs](https://higress.cn/en/docs/latest/overview/what-is-higress/)
 - [Amazon EKS Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/automode.html)
 - [Claude Code — LLM Gateway setup](https://code.claude.com/docs/en/llm-gateway)
 - [NCT source law (KR, Act on Prevention of Divulgence and Protection of Industrial Technology)](https://www.law.go.kr/법령/산업기술의유출방지및보호에관한법률)

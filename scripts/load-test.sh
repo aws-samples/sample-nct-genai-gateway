@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # load-test.sh — NCT GenAI Gateway 부하 테스트 (scale-to-zero → 500명 peak 검증)
 #
+# 게이트웨이 진입점(gateway.nct-gateway.internal)을 Anthropic Messages API(/v1/messages)로
+# 두드린다. 인증은 공유 마스터 키를 `x-api-key` 헤더로 전달(Claude Code CLI와 동일).
+# 진입점에 도달하려면 VPC 내부(Direct Connect / VPN / in-VPC 인스턴스)여야 한다.
+#
 # Usage:
 #   ./scripts/load-test.sh [--users N] [--ramp-secs N] [--alias <alias>]
 #
@@ -13,7 +17,8 @@
 # Pre-requisites:
 #   - curl, jq, python3 installed
 #   - AWS_DEFAULT_REGION=ap-northeast-2
-#   - LITELLM_API_KEY env var (or script fetches master key)
+#   - GATEWAY_API_KEY env var (or script fetches the shared master key)
+#   - GATEWAY_ENDPOINT env var (default: https://gateway.nct-gateway.internal)
 
 set -euo pipefail
 
@@ -22,6 +27,7 @@ USERS=${USERS:-50}
 RAMP_SECS=${RAMP_SECS:-30}
 ALIAS=${ALIAS:-coding}
 DURATION_SECS=${DURATION_SECS:-120}
+GATEWAY_ENDPOINT=${GATEWAY_ENDPOINT:-https://gateway.nct-gateway.internal}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,24 +39,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── Get endpoint & key ────────────────────────────────────────────────────────
-LITELLM_ENDPOINT=$(aws cloudformation describe-stacks \
-  --stack-name NctLiteLLMStack \
-  --region "$REGION" \
-  --query 'Stacks[0].Outputs[?OutputKey==`LiteLLMEndpoint`].OutputValue' \
-  --output text)
-
-if [[ -z "${LITELLM_API_KEY:-}" ]]; then
+# ── Get key ───────────────────────────────────────────────────────────────────
+if [[ -z "${GATEWAY_API_KEY:-}" ]]; then
   SECRET_JSON=$(aws secretsmanager get-secret-value \
-    --secret-id /nct/litellm/master-key \
+    --secret-id /nct/higress/master-key \
     --region "$REGION" --query SecretString --output text)
-  LITELLM_API_KEY=$(echo "$SECRET_JSON" | jq -r '.key')
+  GATEWAY_API_KEY=$(echo "$SECRET_JSON" | jq -r '.key')
 fi
 
 echo ""
 echo "══════════════════════════════════════════════════════════"
 echo "  NCT GenAI Gateway — 부하 테스트"
-echo "  Endpoint : $LITELLM_ENDPOINT"
+echo "  Endpoint : $GATEWAY_ENDPOINT"
 echo "  Alias    : $ALIAS"
 echo "  Users    : $USERS (ramp-up ${RAMP_SECS}s)"
 echo "  Duration : ${DURATION_SECS}s"
@@ -63,14 +63,15 @@ START=$(date +%s%3N)
 
 WARMUP_RESP=$(curl -sf -m 600 -w '\n%{http_code}' \
   -X POST \
-  -H "Authorization: Bearer $LITELLM_API_KEY" \
+  -H "x-api-key: $GATEWAY_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
   -d "{
     \"model\": \"$ALIAS\",
-    \"messages\": [{\"role\":\"user\",\"content\":\"ping\"}],
-    \"max_tokens\": 10
+    \"max_tokens\": 10,
+    \"messages\": [{\"role\":\"user\",\"content\":\"ping\"}]
   }" \
-  "$LITELLM_ENDPOINT/v1/chat/completions" 2>&1 || true)
+  "$GATEWAY_ENDPOINT/v1/messages" 2>&1 || true)
 
 END=$(date +%s%3N)
 COLD_START_MS=$(( END - START ))
@@ -91,8 +92,8 @@ python3 - <<EOF
 import asyncio, time, json, os, statistics
 import httpx
 
-ENDPOINT = "$LITELLM_ENDPOINT"
-API_KEY  = "$LITELLM_API_KEY"
+ENDPOINT = "$GATEWAY_ENDPOINT"
+API_KEY  = "$GATEWAY_API_KEY"
 ALIAS    = "$ALIAS"
 USERS    = $USERS
 RAMP_SECS = $RAMP_SECS
@@ -114,12 +115,12 @@ async def send_request(client: httpx.AsyncClient, user_id: int) -> dict:
     start  = time.time()
     try:
         resp = await client.post(
-            f"{ENDPOINT}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            f"{ENDPOINT}/v1/messages",
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01"},
             json={
                 "model": ALIAS,
-                "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 50,
+                "messages": [{"role": "user", "content": prompt}],
             },
             timeout=120.0,
         )

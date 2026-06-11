@@ -130,10 +130,16 @@ def handler(event, context):
       { id: 'CloudWatchLogsEP', service: ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS },
       { id: 'KmsEP', service: ec2.InterfaceVpcEndpointAwsService.KMS },
       { id: 'SecretsManagerEP', service: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER },
-      // ECS Fargate endpoints — required for LiteLLM ECS tasks (NCT: no internet egress)
+      // ECS Fargate endpoints — required for the SmartRouter / Admin Console ECS tasks (NCT: no internet egress)
       { id: 'EcsEP', service: ec2.InterfaceVpcEndpointAwsService.ECS },
       { id: 'EcsAgentEP', service: ec2.InterfaceVpcEndpointAwsService.ECS_AGENT },
       { id: 'EcsTelemetryEP', service: ec2.InterfaceVpcEndpointAwsService.ECS_TELEMETRY },
+      // SSM endpoints — let the optional in-VPC test client (NctTestClientStack)
+      // be reached via SSM Session Manager with NO public network path. The three
+      // SSM interface endpoints are the documented minimum for Session Manager.
+      { id: 'SsmEP', service: ec2.InterfaceVpcEndpointAwsService.SSM },
+      { id: 'SsmMessagesEP', service: ec2.InterfaceVpcEndpointAwsService.SSM_MESSAGES },
+      { id: 'Ec2MessagesEP', service: ec2.InterfaceVpcEndpointAwsService.EC2_MESSAGES },
     ];
 
     for (const ep of interfaceEndpoints) {

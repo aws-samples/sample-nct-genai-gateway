@@ -4,13 +4,14 @@ import { NetworkStack } from '../lib/stacks/network-stack';
 import { EksClusterStack } from '../lib/stacks/eks-cluster-stack';
 import { KarpenterStack } from '../lib/stacks/karpenter-stack';
 import { VllmStack } from '../lib/stacks/vllm-stack';
-import { LiteLLMEcsStack } from '../lib/stacks/litellm-ecs-stack';
 import { SmartRouterStack } from '../lib/stacks/smart-router-stack';
 import { CertStack } from '../lib/stacks/cert-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { WarmupStack } from '../lib/stacks/warmup-stack';
 import { ReservationStack, DAILY_WARMUP_RULE_NAME } from '../lib/stacks/reservation-stack';
 import { AdminConsoleStack } from '../lib/stacks/admin-console-stack';
+import { TestClientStack } from '../lib/stacks/test-client-stack';
+import { HigressStack } from '../lib/stacks/higress-stack';
 import { VLLM_MODELS } from '../config/models';
 
 const app = new cdk.App();
@@ -44,20 +45,31 @@ const clusterName  = app.node.tryGetContext('clusterName') ?? 'nct-gateway';
 const GATEWAY_ZONE = 'nct-gateway.internal';
 const GATEWAY_DOMAIN = `*.${GATEWAY_ZONE}`;
 
-// vllmEndpoints: per-alias NLB DNS map.
-// First deploy: omit — VllmStack deploys with placeholder endpoints in LiteLLM.
-// After VllmStack deploy, get NLB DNS:
+// vllmEndpoints: per-alias NLB DNS map. Consumed by the Higress applier
+// (apply-higress.sh) to register the vLLM providers and by SmartRouter's cold-vLLM
+// pre-flight. First deploy: omit — providers are applied post-deploy once the NLBs exist.
+// After VllmStack deploy, get each NLB DNS:
 //   kubectl get svc -n vllm <servingName>-nlb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 // Then set via cdk.json context or the CLI:
 //   "vllmEndpoints": { "coding": "http://internal-xxx.elb.amazonaws.com", "ocr": "..." }
 //   -c vllmEndpoints='{"coding":"http://internal-xxx.elb.amazonaws.com"}'
-// and redeploy: cdk deploy NctLiteLLMStack
+// and redeploy NctSmartRouterStack (and re-run apply-higress.sh).
 const vllmEndpoints = getJsonContext<Record<string, string>>('vllmEndpoints', {});
 
 // operatorRoleArns: IAM role ARNs granted AmazonEKSClusterAdminPolicy for break-glass kubectl.
 // Default [] in cdk.json; override via cdk.json/cdk.context.json or the CLI:
 //   -c operatorRoleArns='["arn:aws:iam::123456789012:role/Admin"]'
 const operatorRoleArns = getJsonContext<string[]>('operatorRoleArns', []);
+
+// higressEndpoint: internal NLB DNS of the Higress gateway — the SmartRouter upstream.
+// The NLB is provisioned by k8s post-deploy (no CDK token), so its DNS is fed in like
+// vllmEndpoints rather than referenced cross-stack. First deploy: omit — SmartRouter
+// synthesizes with an empty upstream and is redeployed once the gateway NLB exists:
+//   kubectl get svc -n higress-system higress-gateway-nlb \
+//     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+//   -c higressEndpoint=internal-xxx.elb.amazonaws.com   (host only, no scheme/port)
+// then redeploy NctSmartRouterStack to point it at the gateway.
+const higressEndpoint = (app.node.tryGetContext('higressEndpoint') ?? '').toString().trim();
 
 const networkStack = new NetworkStack(app, 'NctNetworkStack', { env, clusterName });
 
@@ -110,26 +122,35 @@ const certStack = new CertStack(app, 'NctCertStack', {
 });
 certStack.addDependency(networkStack);
 
-const litellmStack = new LiteLLMEcsStack(app, 'NctLiteLLMStack', {
+// Higress AI gateway — the LLM gateway. Installs Higress onto
+// the shared EKS Auto Mode cluster; the Helm release + internal-NLB Service synthesize
+// into NctEksStack (the cluster's owning stack) per addHelmChart scoping, while this stack
+// owns the deploy-ordering edge and the Bedrock IAM user / consumer-key Secrets.
+// Provider/route/key-auth config is applied post-deploy via scripts/apply-higress.sh.
+const higressStack = new HigressStack(app, 'NctHigressStack', {
   env,
-  vpc: networkStack.vpc,
-  vllmModels: Object.values(VLLM_MODELS),
-  vllmEndpoints,
+  cluster: eksStack.cluster,
   certificateArn: certStack.certificateArn,
 });
-litellmStack.addDependency(networkStack);
-litellmStack.addDependency(certStack);
+higressStack.addDependency(eksStack);
+higressStack.addDependency(certStack);
 
 // SmartRouter: intercepts `general` alias → detects scenario → rewrites to coding/math/video/...
 // Phase 8: HTTPS 443 via ACM cert.
 // ANTHROPIC_BASE_URL=https://gateway.nct-gateway.internal (via DnsStack Route53 PHZ)
+// Upstream is the Higress internal NLB — fed in via `-c higressEndpoint=<NLB DNS>` after the
+// gateway NLB is provisioned (k8s post-deploy, no CDK token). On a fresh deploy the upstream
+// is empty; redeploy this stack once the NLB DNS is known.
 const smartRouterStack = new SmartRouterStack(app, 'NctSmartRouterStack', {
   env,
   vpc: networkStack.vpc,
-  litellmEndpoint: litellmStack.albDnsName,
+  upstreamEndpoint: higressEndpoint,
   certificateArn: certStack.certificateArn,
+  // Reuse the per-alias vLLM NLB map for the router's cold-vLLM pre-flight (skip the
+  // gateway when the target alias is scaled to zero). Empty when vllmEndpoints is omitted
+  // → pre-flight disabled, reactive fallback only (the public-repo default).
+  vllmEndpoints,
 });
-smartRouterStack.addDependency(litellmStack);
 
 // Phase 9: Step Functions warm-up/cool-down SFN machines
 // EventBridge schedule moved to NctReservationStack (Phase 10).
@@ -166,15 +187,36 @@ const adminConsoleStack = new AdminConsoleStack(app, 'NctAdminConsoleStack', {
 adminConsoleStack.addDependency(reservationStack);
 adminConsoleStack.addDependency(certStack);
 
-// Route53 Private Hosted Zone: gateway / litellm / admin .nct-gateway.internal
+// Route53 Private Hosted Zone: gateway / admin .nct-gateway.internal
 const dnsStack = new DnsStack(app, 'NctDnsStack', {
   env,
   vpc: networkStack.vpc,
   zoneName: GATEWAY_ZONE,
   smartRouterAlb: smartRouterStack.alb,
-  litellmAlb: litellmStack.alb,
   adminAlb: adminConsoleStack.alb,
 });
 dnsStack.addDependency(smartRouterStack);
-dnsStack.addDependency(litellmStack);
 dnsStack.addDependency(adminConsoleStack);
+
+// Optional in-VPC test client (off by default). Deploys ONE private EC2 reachable
+// only via SSM Session Manager, pre-wired to the gateway with Claude Code installed.
+// Enable with: cdk deploy --all -c deployTestClient=true
+//   warm-up cold  -> SmartRouter falls back to in-region Bedrock (low-spec answer)
+//   nct-warmup    -> GPU spins up, the SAME `claude` command now hits vLLM (Qwen3.5)
+const deployTestClient = getJsonContext<boolean>('deployTestClient', false);
+if (deployTestClient) {
+  const testClientStack = new TestClientStack(app, 'NctTestClientStack', {
+    env,
+    vpc: networkStack.vpc,
+    gatewayZone: GATEWAY_ZONE,
+    masterKeySecret: higressStack.masterKeySecret,
+    warmupSfnArn:   warmupStack.warmupMachine.stateMachineArn,
+    cooldownSfnArn: warmupStack.cooldownMachine.stateMachineArn,
+    caCertSecretName: '/nct/gateway/ca-cert',
+    clusterName,
+  });
+  testClientStack.addDependency(higressStack);
+  testClientStack.addDependency(warmupStack);
+  testClientStack.addDependency(certStack);
+  testClientStack.addDependency(dnsStack);
+}

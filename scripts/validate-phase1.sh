@@ -2,7 +2,7 @@
 # Phase 1 검증: Qwen3.5-27B E2E 테스트
 # 사용법:
 #   ./scripts/validate-phase1.sh --cold-start          # EFS 마운트 + 콜드스타트 시간 측정
-#   ./scripts/validate-phase1.sh --e2e                 # LiteLLM alias 경유 E2E 테스트
+#   ./scripts/validate-phase1.sh --e2e                 # 게이트웨이 alias 경유 E2E 테스트
 #   ./scripts/validate-phase1.sh --scale-cycle         # scale-to-zero → scale-up 사이클 검증
 #   ./scripts/validate-phase1.sh --all                 # 전체 검증
 
@@ -25,8 +25,9 @@ fi
 
 NAMESPACE="vllm"
 SERVING_NAME="qwen35-27b"
-LITELLM_ENDPOINT=${LITELLM_ENDPOINT:-"http://localhost:4000"}
-LITELLM_API_KEY=${LITELLM_API_KEY:-""}
+# 게이트웨이 진입점(Anthropic Messages, x-api-key 마스터 키). VPC 내부에서만 접근 가능.
+GATEWAY_ENDPOINT=${GATEWAY_ENDPOINT:-"https://gateway.nct-gateway.internal"}
+GATEWAY_API_KEY=${GATEWAY_API_KEY:-""}
 
 # ─── 헬퍼 ─────────────────────────────────────────────────────────────────────
 wait_for_pod_ready() {
@@ -106,46 +107,43 @@ run_cold_start() {
 # ─── e2e ──────────────────────────────────────────────────────────────────────
 run_e2e() {
   echo ""
-  echo "=== E2E 테스트 (LiteLLM coding alias) ==="
+  echo "=== E2E 테스트 (gateway coding alias) ==="
 
-  [[ -z "$LITELLM_API_KEY" ]] && {
-    echo "  ⚠  LITELLM_API_KEY 환경변수가 없습니다."
-    echo "     aws secretsmanager get-secret-value --secret-id /nct/litellm/master-key \\"
+  [[ -z "$GATEWAY_API_KEY" ]] && {
+    echo "  ⚠  GATEWAY_API_KEY 환경변수가 없습니다."
+    echo "     aws secretsmanager get-secret-value --secret-id /nct/higress/master-key \\"
     echo "       --query SecretString --output text | python3 -c \"import sys,json; print(json.load(sys.stdin)['key'])\""
     exit 1
   }
 
-  # NLB로 port-forward 하거나 LITELLM_ENDPOINT를 ALB DNS로 설정해야 함
-  echo "▶ LiteLLM 연결 확인 ($LITELLM_ENDPOINT)"
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$LITELLM_ENDPOINT/health" || echo "000")
+  # 게이트웨이 진입점 헬스 체크 (SmartRouter ALB). VPN/Direct Connect/in-VPC에서만 도달 가능.
+  echo "▶ Gateway 연결 확인 ($GATEWAY_ENDPOINT)"
+  HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$GATEWAY_ENDPOINT/health/liveliness" || echo "000")
   if [[ "$HTTP_CODE" != "200" ]]; then
     echo ""
-    echo "  LiteLLM에 연결할 수 없습니다 (HTTP $HTTP_CODE)."
-    echo "  VPN/Direct Connect 연결 또는 kubectl port-forward를 확인하세요:"
+    echo "  Gateway에 연결할 수 없습니다 (HTTP $HTTP_CODE)."
+    echo "  VPN/Direct Connect 연결 또는 in-VPC 인스턴스를 확인하세요:"
     echo ""
-    echo "  # kubectl port-forward로 로컬 테스트:"
-    echo "  ALB_SVC=\$(kubectl get svc -n default -o name | head -1)"
-    echo "  -- 또는 --"
-    echo "  LITELLM_ENDPOINT=http://<alb-dns>:4000 ./scripts/validate-phase1.sh --e2e"
+    echo "  GATEWAY_ENDPOINT=https://gateway.nct-gateway.internal ./scripts/validate-phase1.sh --e2e"
     exit 1
   fi
-  echo "  ✓ LiteLLM 연결 OK"
+  echo "  ✓ Gateway 연결 OK"
 
-  # coding alias 테스트
+  # coding alias 테스트 (warm 시 vLLM 직접, cold 시 SmartRouter가 Bedrock으로 fallback)
   echo ""
   echo "▶ 'coding' alias 테스트 (Qwen3.5-27B)"
-  RESPONSE=$(curl -s -X POST "$LITELLM_ENDPOINT/v1/chat/completions" \
+  RESPONSE=$(curl -sk -X POST "$GATEWAY_ENDPOINT/v1/messages" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $LITELLM_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "x-api-key: $GATEWAY_API_KEY" \
     -d '{
       "model": "coding",
-      "messages": [{"role": "user", "content": "Write a Python function that returns the nth Fibonacci number. Just the code, no explanation."}],
       "max_tokens": 200,
-      "temperature": 0
+      "messages": [{"role": "user", "content": "Write a Python function that returns the nth Fibonacci number. Just the code, no explanation."}]
     }')
 
   MODEL_USED=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('model','unknown'))" 2>/dev/null || echo "parse error")
-  CONTENT=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])" 2>/dev/null || echo "parse error")
+  CONTENT=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(''.join(b.get('text','') for b in d.get('content',[])))" 2>/dev/null || echo "parse error")
 
   echo "  모델: $MODEL_USED"
   echo "  응답:"
@@ -159,24 +157,24 @@ run_e2e() {
     exit 1
   fi
 
-  # claude alias 테스트 (Bedrock fallback)
+  # claude alias 테스트 (Bedrock direct)
   echo ""
-  echo "▶ 'claude-3-5-sonnet-20241022' alias 테스트 (Bedrock fallback)"
-  RESPONSE2=$(curl -s -X POST "$LITELLM_ENDPOINT/v1/chat/completions" \
+  echo "▶ 'claude-3-5-sonnet-20241022' alias 테스트 (Bedrock IN_REGION)"
+  RESPONSE2=$(curl -sk -X POST "$GATEWAY_ENDPOINT/v1/messages" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $LITELLM_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "x-api-key: $GATEWAY_API_KEY" \
     -d '{
       "model": "claude-3-5-sonnet-20241022",
-      "messages": [{"role": "user", "content": "Reply with only the word: PONG"}],
       "max_tokens": 10,
-      "temperature": 0
+      "messages": [{"role": "user", "content": "Reply with only the word: PONG"}]
     }')
 
-  CONTENT2=$(echo "$RESPONSE2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])" 2>/dev/null || echo "parse error")
+  CONTENT2=$(echo "$RESPONSE2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(''.join(b.get('text','') for b in d.get('content',[])))" 2>/dev/null || echo "parse error")
   echo "  응답: $CONTENT2"
 
   if echo "$CONTENT2" | grep -qi "PONG"; then
-    echo "  ✓ Bedrock fallback E2E 테스트 통과"
+    echo "  ✓ Bedrock E2E 테스트 통과"
   else
     echo "  ⚠  Bedrock 응답 예상과 다름"
     echo "$RESPONSE2"
