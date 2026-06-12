@@ -16,22 +16,31 @@ A region-locked LLM Gateway sample that forces **all inference to happen only in
 **What** — Researchers keep using the **Claude Code CLI unchanged**; the gateway routes internally to Seoul in-region Bedrock or to self-hosted open-source vLLM on EKS. Traffic never leaves the region.
 **Why** — In-region managed models alone trap you at ~37% of frontier; this repo's self-hosted `coding` (Qwen3.5-27B) reaches **~82% of frontier** in-region.
 
-**How (2-command):**
+**How (deploy → try → clean up):**
 
 ```bash
 npm install
 
-# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 16 stacks)
+# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 17 stacks, test client included)
 AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 
 # [2] Post-deploy — discover NLB DNS → rewire SmartRouter → apply Higress config
 ./scripts/finalize-deploy.sh
+
+# [3] Try it — SSM into the in-VPC test client (EC2 + Claude Code)
+aws ssm start-session --target <NctTestClientStack InstanceId>
+
+# [4] Test — cold falls back to Bedrock (Seoul); after `nct-warmup coding` the same command hits vLLM (Qwen3.5)
+claude "Refactor this function for readability: ..."
+
+# [5] Clean up — tear everything down when done
+cdk destroy --all --force
 ```
 
-> There are **required prerequisites** — a HuggingFace token (required), and, if you use `longcontext`/`math`, gated-model license approval. Read **[Prerequisites](#prerequisites)** before you start. Phased deploy and operational options are under **[Deployment](#deployment)**.
+> There are **required prerequisites** — a HuggingFace token (required), and, if you use `longcontext`/`math`, gated-model license approval. Read **[Prerequisites](#prerequisites)** before you start. Phased deploy, the hands-on try-it, and operational options are under **[Deployment](#deployment)**.
 
 - **Region pinned**: `ap-northeast-2` (Seoul) — hardcoded in source (supports NCT requirements)
-- **Stacks**: 16 CDK stacks (17 with the optional test client)
+- **Stacks**: 17 CDK stacks (test client included by default; 16 with `-c deployTestClient=false`)
 - **Models served**: 6 vLLM (scale-to-zero) + 2 Bedrock (ON_DEMAND, IN_REGION)
 - **Endpoints**: HTTPS 443, Route 53 Private Hosted Zone (`*.nct-gateway.internal`)
 
@@ -124,7 +133,7 @@ The crux of the gateway data plane is the NLBs that k8s provisions **after** dep
 ```bash
 npm install
 
-# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 16 stacks)
+# [1] Infrastructure — deploy all stacks (~60-90 min, EKS Auto Mode + 17 stacks, test client included)
 AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 
 # [2] Post-deploy — discover NLB DNS → rewire SmartRouter → apply Higress config
@@ -137,7 +146,30 @@ AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 2. **Rewire SmartRouter** — `cdk deploy NctSmartRouterStack -c higressEndpoint=<discovered>` points the upstream at the Higress gateway NLB.
 3. **Apply Higress config** — provider/route/key-auth consumer via the console REST API (`scripts/apply-higress.sh`). **On a first deploy with no console admin yet, it auto-bootstraps via `/system/init`** (admin PW fixed to the gateway master-key, recoverable from Secrets Manager afterward).
 
-On completion it prints a banner with the entry point (`https://gateway.nct-gateway.internal`), how to fetch the master-key, and how to try the test client. Re-running is idempotent (re-discover NLB DNS → SmartRouter no-op → Higress upsert).
+On completion it prints a banner with the entry point (`https://gateway.nct-gateway.internal`), how to fetch the master-key, and how to reach the test client. Re-running is idempotent (re-discover NLB DNS → SmartRouter no-op → Higress upsert).
+
+### Try it + clean up (3–5)
+
+The deploy **includes an in-VPC test client (one EC2 instance) by default** — it boots with Claude Code pre-installed and wired to the gateway, reachable **only via SSM Session Manager**. You can experience the gateway hands-on right away (details under [Try it](#try-it-in-vpc-test-client-included-by-default)).
+
+```bash
+# [3] SSM in — the InstanceId is an NctTestClientStack output
+INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name NctTestClientStack \
+  --region ap-northeast-2 \
+  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
+aws ssm start-session --target "$INSTANCE_ID" --region ap-northeast-2
+
+# [4] Cold falls back to Bedrock (Seoul). After nct-warmup coding, the same command hits vLLM (Qwen3.5)
+claude "Refactor this function for readability: ..."
+nct-warmup coding        # GPU boot (a few minutes); poll with nct-status
+claude "Refactor this function for readability: ..."   # now vLLM directly
+nct coding               # scale to zero when done (stop GPU billing)
+
+# [5] Tear down the demo — delete all stacks
+cdk destroy --all --force
+```
+
+> If you don't need the test client, exclude it with `cdk deploy --all -c deployTestClient=false` (16 stacks). When included, it's a burstable t3.small in **standard credit mode**, so idle cost is negligible (~$0.024/hr).
 
 > **Operators**: `operatorRoleArns` in `cdk.json` ships empty (`vllmEndpoints`/`higressEndpoint` are filled by `finalize-deploy.sh`). Pass your own break-glass role ARN(s) via `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'` (or set them in your own `cdk.json`); the app handles empty values.
 
@@ -216,13 +248,14 @@ curl https://gateway.nct-gateway.internal/v1/messages \
 
 ---
 
-## Try it: in-VPC test client (optional)
+## Try it: in-VPC test client (included by default)
 
-To experience the gateway hands-on, you can deploy one test EC2 instance inside the VPC. It boots with Claude Code (the GenAI harness) pre-installed and wired to the gateway, reachable **only via SSM Session Manager** (no public IP, no SSH — it tunnels in over the SSM VPC endpoints).
+So you can experience the gateway hands-on, the deploy **includes** one test EC2 instance inside the VPC. It boots with Claude Code (the GenAI harness) pre-installed and wired to the gateway, reachable **only via SSM Session Manager** (no public IP, no SSH — it tunnels in over the SSM VPC endpoints). The instance is a burstable **t3.small in standard credit mode** — idle cost is negligible (~$0.024/hr), and bursts above baseline are throttled rather than billed.
 
 ```bash
-# Enable via the option gate (off by default) — the 16 stacks + NctTestClientStack
-cdk deploy --all -c deployTestClient=true
+# Included by default — `cdk deploy --all` brings up NctTestClientStack with it.
+# Exclude it if you don't need it (16 stacks):
+cdk deploy --all -c deployTestClient=false
 ```
 
 The point is to **compare cold vs. warm with the same command**. The client pins one model (`general`); SmartRouter's automatic fallback handles the switch:
@@ -318,7 +351,7 @@ Comparing the current `coding` alias (**Qwen3.5-27B**) against the frontier ceil
 ---
 
 <details>
-<summary><strong>CDK Stacks (16)</strong> — per-stack role table (expand)</summary>
+<summary><strong>CDK Stacks (17)</strong> — per-stack role table (expand)</summary>
 
 | Stack | Role |
 |-------|------|
@@ -338,6 +371,7 @@ Comparing the current `coding` alias (**Qwen3.5-27B**) against the frontier ceil
 | `NctReservationStack` | DynamoDB reservation + reserve/expire Lambda + EventBridge |
 | `NctAdminConsoleStack` | FastAPI ECS + ALB (`admin.nct-gateway.internal`) |
 | `NctDnsStack` | Route53 PHZ `nct-gateway.internal` + alias records |
+| `NctTestClientStack` | in-VPC test EC2 (t3.small standard credit, SSM-only) + Claude Code. Included by default; exclude with `-c deployTestClient=false` |
 
 </details>
 
@@ -442,7 +476,8 @@ scripts/warmup-request.sh --alias all --duration 30m
 | Internal LB × 3 (SmartRouter ALB + Admin ALB + Higress NLB) | — | ~$0.07 |
 | NAT GW | — | ~$0.05 |
 | S3 Storage (model cache) | ~500 GB | ~$0.02 |
-| **Always-on total** | | **\~$0.45/hr (\~$324/month)** |
+| Test client (included by default) | t3.small (standard credit) | \~$0.024 + EBS 20GB gp3 \~$0.002 |
+| **Always-on total** | | **\~$0.47/hr (\~$340/month)** |
 
 ### When vLLM models are running (per alias)
 | Alias | Instance | Per hour (added) |

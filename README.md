@@ -16,22 +16,31 @@
 **무엇** — 연구원은 **Claude Code CLI를 그대로** 쓰고, gateway가 내부적으로 서울 in-region Bedrock 또는 self-host open-source vLLM(EKS)으로 라우팅한다. 트래픽이 리전을 벗어나지 않는다.
 **왜** — 서울 in-region 매니지드 모델만 쓰면 frontier의 ~37% 수준에 갇히지만, 이 repo의 self-host `coding`(Qwen3.5-27B)은 frontier의 **~82%** 수준을 in-region으로 낸다.
 
-**어떻게 (2-command):**
+**어떻게 (배포 → 체험 → 정리):**
 
 ```bash
 npm install
 
-# [1] 인프라 — 전체 스택 배포 (~60-90분, EKS Auto Mode + 16 스택)
+# [1] 인프라 — 전체 스택 배포 (~60-90분, EKS Auto Mode + 17 스택, 테스트 클라이언트 포함)
 AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 
 # [2] 후처리 — NLB DNS 조회 → SmartRouter 재배선 → Higress 구성 적용
 ./scripts/finalize-deploy.sh
+
+# [3] 체험 — VPC 안 테스트 클라이언트(EC2 + Claude Code)에 SSM 접속
+aws ssm start-session --target <NctTestClientStack 의 InstanceId>
+
+# [4] 테스트 — cold 면 Bedrock(Seoul); `nct-warmup coding` 후 같은 명령이 vLLM(Qwen3.5)로
+claude "이 함수를 읽기 좋게 리팩터링해줘: ..."
+
+# [5] 정리 — 데모 종료 시 전체 삭제
+cdk destroy --all --force
 ```
 
-> **배포 전 필수 준비**가 있다 — HuggingFace 토큰(필수)과, `longcontext`·`math`를 쓸 경우 gated 모델 라이선스 승인. 먼저 **[Prerequisites](#prerequisites)** 를 확인하고 시작할 것. 단계별 배포·운영 옵션은 **[Deployment](#deployment)**.
+> **배포 전 필수 준비**가 있다 — HuggingFace 토큰(필수)과, `longcontext`·`math`를 쓸 경우 gated 모델 라이선스 승인. 먼저 **[Prerequisites](#prerequisites)** 를 확인하고 시작할 것. 단계별 배포·체험·운영 옵션은 **[Deployment](#deployment)**.
 
 - **Region 고정**: `ap-northeast-2` (Seoul) — 코드상 하드코딩 (NCT 요건 지원)
-- **스택 수**: 16개 (옵션 테스트 클라이언트 포함 시 17개)
+- **스택 수**: 17개 (테스트 클라이언트 기본 포함; `-c deployTestClient=false`로 제외 시 16개)
 - **서빙 중 모델**: 6종 vLLM (scale-to-zero) + 2종 Bedrock (ON_DEMAND, IN_REGION)
 - **엔드포인트**: HTTPS 443, Route53 Private Hosted Zone (`*.nct-gateway.internal`)
 
@@ -124,7 +133,7 @@ vLLM pod가 모델 weight를 받을 때 HF 토큰을 쓴다. **없으면 vLLM po
 ```bash
 npm install
 
-# [1] 인프라 — 전체 스택 배포 (~60-90분, EKS Auto Mode + 16 스택)
+# [1] 인프라 — 전체 스택 배포 (~60-90분, EKS Auto Mode + 17 스택, 테스트 클라이언트 포함)
 AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 
 # [2] 후처리 — NLB DNS 조회 → SmartRouter 재배선 → Higress 구성 적용
@@ -137,7 +146,30 @@ AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 2. **SmartRouter 재배선** — `cdk deploy NctSmartRouterStack -c higressEndpoint=<조회값>`으로 upstream을 Higress gateway NLB로 연결.
 3. **Higress 구성 적용** — provider/route/key-auth consumer를 console REST로 적용 (`scripts/apply-higress.sh`). **첫 배포라 console admin이 없으면 `/system/init`로 자동 부트스트랩**(admin PW = gateway master-key로 고정, 이후 Secrets Manager로 복구 가능).
 
-완료되면 진입점(`https://gateway.nct-gateway.internal`)·master-key 조회법·테스트 클라이언트 체험법을 배너로 출력한다. 재실행은 멱등(NLB 재조회 → SmartRouter no-op → Higress upsert).
+완료되면 진입점(`https://gateway.nct-gateway.internal`)·master-key 조회법·테스트 클라이언트 접속법을 배너로 출력한다. 재실행은 멱등(NLB 재조회 → SmartRouter no-op → Higress upsert).
+
+### 체험 + 정리 (3~5)
+
+배포에는 **VPC 안 테스트 클라이언트(EC2 1대)가 기본 포함**된다 — Claude Code가 미리 설치·연결된 채 부팅되고 **SSM Session Manager로만** 접속한다. 게이트웨이를 손으로 바로 체험할 수 있다(상세는 [Try it](#try-it-in-vpc-테스트-클라이언트-기본-포함)).
+
+```bash
+# [3] SSM 접속 — InstanceId 는 NctTestClientStack output
+INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name NctTestClientStack \
+  --region ap-northeast-2 \
+  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
+aws ssm start-session --target "$INSTANCE_ID" --region ap-northeast-2
+
+# [4] cold 면 Bedrock(Seoul). nct-warmup coding 후엔 같은 명령이 vLLM(Qwen3.5)로
+claude "이 함수를 읽기 좋게 리팩터링해줘: ..."
+nct-warmup coding        # GPU 기동(수 분), nct-status 로 폴링
+claude "이 함수를 읽기 좋게 리팩터링해줘: ..."   # 이제 vLLM 직접
+nct coding               # 끝나면 scale-to-zero (GPU 과금 정지)
+
+# [5] 데모 종료 — 전체 스택 삭제
+cdk destroy --all --force
+```
+
+> 테스트 클라이언트가 필요 없으면 `cdk deploy --all -c deployTestClient=false`로 제외한다(스택 16개). 포함돼도 burstable t3.small **standard credit 모드**라 idle 비용은 미미하다(~$0.024/hr).
 
 > **운영자 주의**: `cdk.json`의 `operatorRoleArns`는 비어 있는 상태로 배포된다(`vllmEndpoints`·`higressEndpoint`는 `finalize-deploy.sh`가 채운다). break-glass kubectl용 role ARN은 `-c operatorRoleArns='["arn:aws:iam::<account>:role/<role>"]'`로 넘기거나(또는 본인 `cdk.json`에 지정), 빈 값이면 코드가 그대로 처리한다.
 
@@ -216,13 +248,14 @@ curl https://gateway.nct-gateway.internal/v1/messages \
 
 ---
 
-## Try it: in-VPC 테스트 클라이언트 (선택)
+## Try it: in-VPC 테스트 클라이언트 (기본 포함)
 
-게이트웨이를 **직접 체험**하고 싶다면, VPC 안에 테스트용 EC2 1대를 함께 띄울 수 있다. Claude Code(GenAI harness)가 미리 설치·게이트웨이 연결까지 끝난 상태로 부팅되고, **SSM Session Manager로만** 접속한다(public IP·SSH 없음, SSM VPC endpoint 경유).
+게이트웨이를 **직접 체험**할 수 있도록, 배포에는 VPC 안 테스트용 EC2 1대가 **기본 포함**된다. Claude Code(GenAI harness)가 미리 설치·게이트웨이 연결까지 끝난 상태로 부팅되고, **SSM Session Manager로만** 접속한다(public IP·SSH 없음, SSM VPC endpoint 경유). 인스턴스는 burstable **t3.small (standard credit 모드)** — idle 비용 ~$0.024/hr로 미미하고, baseline 초과 burst는 과금이 아니라 throttle된다.
 
 ```bash
-# 옵션 게이트로 활성화 (기본 off) — 기존 16스택 + NctTestClientStack
-cdk deploy --all -c deployTestClient=true
+# 기본 포함 — `cdk deploy --all` 만으로 NctTestClientStack 이 함께 뜬다.
+# 필요 없으면 제외(스택 16개):
+cdk deploy --all -c deployTestClient=false
 ```
 
 핵심은 **같은 명령으로 cold/warm을 비교**하는 것이다. 클라이언트는 model 하나(`general`)만 고정하고, 전환은 SmartRouter의 자동 fallback이 처리한다:
@@ -318,7 +351,7 @@ nct coding          # 해당 alias를 0 replica로 복귀
 ---
 
 <details>
-<summary><strong>CDK Stacks (16개)</strong> — 스택별 역할 표 (펼치기)</summary>
+<summary><strong>CDK Stacks (17개)</strong> — 스택별 역할 표 (펼치기)</summary>
 
 | Stack | 역할 |
 |-------|------|
@@ -338,6 +371,7 @@ nct coding          # 해당 alias를 0 replica로 복귀
 | `NctReservationStack` | DynamoDB reservation + reserve/expire Lambda + EventBridge |
 | `NctAdminConsoleStack` | FastAPI ECS + ALB (`admin.nct-gateway.internal`) |
 | `NctDnsStack` | Route53 PHZ `nct-gateway.internal` + alias records |
+| `NctTestClientStack` | in-VPC 테스트 EC2 (t3.small standard credit, SSM 전용) + Claude Code. 기본 포함, `-c deployTestClient=false`로 제외 |
 
 </details>
 
@@ -442,7 +476,8 @@ scripts/warmup-request.sh --alias all --duration 30m
 | Internal LB × 3 (SmartRouter ALB + Admin ALB + Higress NLB) | — | ~$0.07 |
 | NAT GW | — | ~$0.05 |
 | S3 Storage (모델 캐시) | ~500 GB | ~$0.02 |
-| **상시 합계** | | **\~$0.45/hr (\~$324/month)** |
+| 테스트 클라이언트 (기본 포함) | t3.small (standard credit) | \~$0.024 + EBS 20GB gp3 \~$0.002 |
+| **상시 합계** | | **\~$0.47/hr (\~$340/month)** |
 
 ### vLLM 모델 기동 시 (alias 별)
 | Alias | 인스턴스 | 시간당 추가 |

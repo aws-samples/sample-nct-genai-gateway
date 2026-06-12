@@ -194,6 +194,11 @@ export class TestClientStack extends cdk.Stack {
       securityGroup: sg,
       userData,
       requireImdsv2: true,
+      // Burstable in STANDARD credit mode: bursts above the CPU baseline are throttled,
+      // not billed as surcharge vCPU-hours (the default 'unlimited' would bill them).
+      // The demo workload (npm install + a few `claude` runs) is short and bursty, so
+      // standard keeps idle cost negligible (~$0.024/hr) with no surprise charges.
+      creditSpecification: ec2.CpuCredits.STANDARD,
       blockDevices: [{
         deviceName: '/dev/xvda',
         volume: ec2.BlockDeviceVolume.ebs(20, {

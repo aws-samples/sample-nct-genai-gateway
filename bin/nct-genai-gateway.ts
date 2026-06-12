@@ -198,12 +198,13 @@ const dnsStack = new DnsStack(app, 'NctDnsStack', {
 dnsStack.addDependency(smartRouterStack);
 dnsStack.addDependency(adminConsoleStack);
 
-// Optional in-VPC test client (off by default). Deploys ONE private EC2 reachable
-// only via SSM Session Manager, pre-wired to the gateway with Claude Code installed.
-// Enable with: cdk deploy --all -c deployTestClient=true
+// In-VPC test client (included by default; opt out with -c deployTestClient=false).
+// Deploys ONE private EC2 reachable only via SSM Session Manager, pre-wired to the
+// gateway with Claude Code installed. Runs as a burstable t3.small in STANDARD credit
+// mode (throttle, not surcharge) so idle cost stays negligible.
 //   warm-up cold  -> SmartRouter falls back to in-region Bedrock (low-spec answer)
 //   nct-warmup    -> GPU spins up, the SAME `claude` command now hits vLLM (Qwen3.5)
-const deployTestClient = getJsonContext<boolean>('deployTestClient', false);
+const deployTestClient = getJsonContext<boolean>('deployTestClient', true);
 if (deployTestClient) {
   const testClientStack = new TestClientStack(app, 'NctTestClientStack', {
     env,

@@ -81,10 +81,16 @@ cat <<BANNER
     aws secretsmanager get-secret-value --secret-id $MASTER_KEY_SECRET \\
       --region $REGION --query SecretString --output text | jq -r .key
 
-  체험 — VPC 안 테스트 클라이언트(EC2 + Claude Code, SSM 접속):
-    cdk deploy --all -c deployTestClient=true   # (재배포, 옵션)
-    aws ssm start-session --target <InstanceId>
+  체험 — VPC 안 테스트 클라이언트(EC2 + Claude Code, 기본 포함, SSM 접속):
+    INSTANCE_ID=\$(aws cloudformation describe-stacks --stack-name NctTestClientStack \\
+      --region $REGION --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \\
+      --output text)
+    aws ssm start-session --target \$INSTANCE_ID --region $REGION
     → warm 전: SmartRouter 가 in-region Bedrock 으로 fallback
     → nct-warmup coding 후: 같은 요청이 vLLM(Qwen3.5)로 직접
+    (테스트 클라이언트 제외 배포: cdk deploy --all -c deployTestClient=false)
+
+  정리 — 전체 스택 삭제(데모 종료 시):
+    cdk destroy --all --force
 ══════════════════════════════════════════════════════════════════════
 BANNER
