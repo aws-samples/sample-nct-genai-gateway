@@ -161,15 +161,39 @@ export interface BedrockModelConfig {
   awsRegion?: string;
 }
 
+// Order matters for the SmartRouter cold-fallback cascade: BEDROCK_MODELS[0] is the
+// PRIMARY fallback target, [1] is the SECONDARY (cascaded to on a primary throttle). The
+// Higress provider/route generator (higress-config.ts) iterates the list order-independently,
+// so this order ONLY affects which Bedrock model the cold path tries first.
+//
+// DEFAULT = QUALITY-FIRST: Sonnet 3.5 PRIMARY, Haiku 3 SECONDARY. This gateway's whole reason
+// for existing is accuracy/quality (it self-hosts Qwen to recover ~82% of frontier coding) —
+// not speed. So the cold fallback, too, defaults to the higher-quality model first, and only
+// cascades to Haiku 3 when Sonnet throttles. This is the opposite of optimizing the cold path
+// for raw latency, and it is a deliberate product choice.
+//
+// ⚠️ KNOWN TRADE-OFF (measured Seoul on-demand, 2026-06-14): the Sonnet 3.5 pool was ~93%
+// throttled (`Too many connections`) vs Haiku 3 ~43% (a separate pool, RPM 400 vs 50). With
+// Sonnet primary, a cold Claude Code request can spend 16–93 s (occasionally timing out) on
+// botocore adaptive-retry backoff before answering or cascading; with Haiku primary it was
+// 4–6 s. We accept the slower cold start for higher quality by default. A customer who values
+// cold-start LATENCY over quality can flip the order at deploy time WITHOUT editing source:
+//   cdk deploy ... -c coldFallbackOrder=availability   (→ Haiku primary, Sonnet secondary)
+// (default is `quality`). The cold path is best-effort anyway — for production-grade speed AND
+// quality, warm up the vLLM alias so the self-hosted model serves directly. Revisit the
+// default if the Seoul pools' relative capacity changes.
 export const BEDROCK_MODELS: BedrockModelConfig[] = [
   {
-    // Claude Code CLI target alias — Sonnet fallback
+    // PRIMARY cold-fallback target (DEFAULT = quality-first). Higher quality than Haiku; the
+    // Seoul on-demand pool is more throttled, accepted as the default trade-off (see note).
     modelName: 'claude-3-5-sonnet-20241022',
     bedrockModelId: 'anthropic.claude-3-5-sonnet-20240620-v1:0',
     awsRegion: 'ap-northeast-2',
   },
   {
-    // EOL 2026-09-10 — replace with Haiku 3.5 when Seoul IN_REGION available
+    // SECONDARY — cascaded to only when the primary (Sonnet) throttles. Faster/less-throttled
+    // pool, so it is also the PRIMARY when deployed with `-c coldFallbackOrder=availability`.
+    // EOL 2026-09-10 — replace with Haiku 3.5 when Seoul IN_REGION available.
     modelName: 'claude-3-haiku-20240307',
     bedrockModelId: 'anthropic.claude-3-haiku-20240307-v1:0',
     awsRegion: 'ap-northeast-2',

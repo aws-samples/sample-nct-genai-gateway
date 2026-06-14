@@ -27,8 +27,12 @@ AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 # [2] Post-deploy — discover NLB DNS → rewire SmartRouter → apply Higress config
 ./scripts/finalize-deploy.sh
 
-# [3] Try it — SSM into the in-VPC test client (EC2 + Claude Code)
-aws ssm start-session --target <NctTestClientStack InstanceId>
+# [3] Try it — SSM into the in-VPC test client (located by Name tag, not a hard-coded id)
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters Name=tag:Name,Values=nct-test-client Name=instance-state-name,Values=running \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
+bash -l                              # ★ loads the gateway env
 
 # [4] Test — cold falls back to Bedrock (Seoul); after `nct-warmup coding` the same command hits vLLM (Qwen3.5)
 claude "Refactor this function for readability: ..."
@@ -84,6 +88,54 @@ A Reservation subsystem (EventBridge + Lambda + DynamoDB + Step Functions)
 drives vLLM warmup/cooldown on a weekday 08:30–19:30 KST schedule. The entire path stays within a single region (Seoul).
 
 > Editable source: [`docs/architecture/nct-architecture.drawio`](docs/architecture/nct-architecture.drawio) (draw.io)
+
+### Routing flow (2 stages)
+
+A request reaches a backend in **two stages**. Contrary to a common assumption, *Higress does not route by content* — the upstream **SmartRouter** picks an alias from the content, and **Higress matches only on that alias name**.
+
+```mermaid
+flowchart TD
+    C["Researcher · Claude Code CLI<br/>model: general"]
+    C -->|"HTTPS 443 · Anthropic Messages"| SR
+
+    subgraph SR["① SmartRouter (ECS Fargate) — content-based"]
+        DET["detect_scenario()<br/>regex keyword counting<br/>(no LLM, no embeddings)<br/>no match → default = coding"]
+        CLAMP["max_tokens clamp<br/>(pre-trim what exceeds the window)"]
+        DET --> CLAMP
+    end
+
+    SR --> PF{"target alias vLLM<br/>/health pre-flight (~2s)"}
+    PF -->|"cold (0 replicas)"| BR
+    PF -->|"warm"| HG
+
+    subgraph HG["② Higress AI Gateway (EKS) — name match"]
+        EQ["model-name EQUAL match (ignores content)<br/>alias → vLLM serving name rewrite"]
+    end
+
+    HG -->|"200"| VL["vLLM × 6 (EKS Auto Mode, scale-to-zero)<br/>coding·video=Qwen3.5-27B · ocr=InternVL3<br/>math=Gemma4 · longcontext=Llama4 · audio=Phi-4"]
+    HG -->|"4xx/5xx<br/>(context overflow → halve max_tokens, retry)"| BR
+
+    subgraph BR["Bedrock-direct fallback (boto3, gateway bypass)"]
+        SN["Claude 3.5 Sonnet — primary (default, quality-first)"]
+        HK["Claude 3 Haiku — secondary"]
+        SN -->|"cascade only on throttle"| HK
+    end
+
+    VL --> SEOUL(["Entirely within Seoul ap-northeast-2 — NCT preserved"])
+    BR --> SEOUL
+```
+
+**① SmartRouter — content-based alias selection (no LLM).** For a `model:general` request, `detect_scenario()` analyzes the prompt and picks one of the 6 aliases. It is **pure regex keyword counting** — not an inference LLM or embedding similarity:
+- Multimodal is decided up front — an `audio/*` content block → `audio`, `video/*` → `video`.
+- Text over 60,000 chars → `longcontext`.
+- Otherwise the **match count** of the `math`/`coding`/`ocr` regexes picks the top-scoring alias.
+- **All zero → default = `coding`** (Qwen3.5-27B is the strongest general-purpose model). So generic/miscellaneous questions all route to `coding`.
+
+Specifying an alias directly (e.g. `model:coding`) skips `detect_scenario` and passes through.
+
+**② Higress — alias-name match only (dumb router).** Once SmartRouter rewrites `model` to the chosen alias, Higress does not re-inspect content — it selects a route by **EQUAL (exact) match** on `modelPredicates`, then the provider's `modelMapping` rewrites the alias to the actual vLLM serving name (e.g. `coding`→`qwen35-27b`) before the upstream call.
+
+**Fallback is owned by SmartRouter, not Higress.** vLLM routes carry **no** cross-provider fallback on purpose (Higress ai-proxy 2.0.0 mis-signs Bedrock `/v1/messages` SigV4 — [higress#3809](https://github.com/alibaba/higress/issues/3809)). Instead SmartRouter handles it in two layers: (1) **pre-flight** — if the target alias's vLLM is cold (0 replicas), bypass Higress and go straight to Bedrock-direct; (2) **reactive** — if Higress returns 4xx/5xx (e.g. a context-window 400 → halve `max_tokens` and retry), fall through to Bedrock-direct. In either path the fallback target is the **scenario-agnostic common in-region Bedrock** (default Sonnet→Haiku, flip with `-c coldFallbackOrder`) — there is no math-specific or coding-specific Bedrock. See the [FAQ](#faq) for details.
 
 ---
 
@@ -153,17 +205,19 @@ On completion it prints a banner with the entry point (`https://gateway.nct-gate
 The deploy **includes an in-VPC test client (one EC2 instance) by default** — it boots with Claude Code pre-installed and wired to the gateway, reachable **only via SSM Session Manager**. You can experience the gateway hands-on right away (details under [Try it](#try-it-in-vpc-test-client-included-by-default)).
 
 ```bash
-# [3] SSM in — the InstanceId is an NctTestClientStack output
-INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name NctTestClientStack \
-  --region ap-northeast-2 \
-  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
-aws ssm start-session --target "$INSTANCE_ID" --region ap-northeast-2
+# [3] SSM in — locate by the Name tag (nct-test-client). (CloudFormation output also works:
+#     aws cloudformation describe-stacks --stack-name NctTestClientStack --query ...InstanceId)
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters Name=tag:Name,Values=nct-test-client Name=instance-state-name,Values=running \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
+bash -l                  # ★ loads the gateway env (do not use plain bash)
 
 # [4] Cold falls back to Bedrock (Seoul). After nct-warmup coding, the same command hits vLLM (Qwen3.5)
 claude "Refactor this function for readability: ..."
-nct-warmup coding        # GPU boot (a few minutes); poll with nct-status
+nct-warmup coding 2h     # timed reservation (auto-cools-down at expiry); poll with nct-status
 claude "Refactor this function for readability: ..."   # now vLLM directly
-nct coding               # scale to zero when done (stop GPU billing)
+nct-cooldown coding      # clear reservation + scale to zero when done (stop GPU billing)
 
 # [5] Tear down the demo — delete all stacks
 cdk destroy --all --force
@@ -261,35 +315,78 @@ cdk deploy --all -c deployTestClient=false
 The point is to **compare cold vs. warm with the same command**. The client pins one model (`general`); SmartRouter's automatic fallback handles the switch:
 
 ```bash
-# 1) Connect over SSM (instance ID is an NctTestClientStack output)
-aws ssm start-session --target <instance-id> --region ap-northeast-2
+# 1) Connect over SSM — locate by the Name tag instead of a hard-coded id
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters "Name=tag:Name,Values=nct-test-client" \
+                 "Name=instance-state-name,Values=running" \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
 
-# Show the walkthrough
+# After connecting — ★ bash -l is required (loads the gateway env). Plain bash won't.
+bash -l
+
+# Show the walkthrough / check which backend answers right now
 nct-demo
+nct-which                 # model + x-nct-fallback header (cold=bedrock-direct, warm=qwen, no header)
 
 # 2) BEFORE warm-up (GPU cold): the vLLM alias has 0 replicas, so SmartRouter
 #    detects the cold alias and falls back directly to in-region Bedrock (Claude 3.5 Sonnet, Seoul)
 claude "Refactor this function for readability: ..."
 
-# 3) Warm up the GPU model (a few minutes; poll with nct-status)
-nct-warmup coding
-nct-status          # SUCCEEDED = ready
+# 3) Warm up the GPU model (a few minutes; poll with nct-status) — timed: auto-cools-down at expiry
+nct-warmup coding 2h      # 2h / 90m / 3600(seconds) · default 1h
+nct-status                # coding shows WARM (reserved, ~Nm left) once ready
 
 # 4) AFTER warm-up: the SAME command now routes to self-hosted Qwen3.5-27B (vLLM)
 claude "Refactor this function for readability: ..."
 
-# 5) Stop GPU billing when done
-nct coding          # scale the alias back to zero replicas
+# 5) Stop GPU billing when done (manual stop before expiry)
+nct-cooldown coding       # clear reservation + scale the alias back to zero replicas
 ```
 
 | Helper | What it does |
 |--------|--------------|
-| `nct-warmup <alias>` | Spin up the alias's vLLM deployment (Warmup SFN) |
-| `nct-status` | Recent warm-up execution states (RUNNING→SUCCEEDED) |
-| `nct <alias>` | Scale the alias back to zero (Cooldown SFN) |
+| `nct-which [max_tokens]` | Which backend answers `coding` right now (model + `x-nct-fallback` header) |
+| `nct-warmup <alias> [dur]` | **Timed reservation** to spin up the alias (`2h`/`90m`/`3600`, default 1h); auto-cools-down at expiry |
+| `nct-status` | Per-alias warm/cold + reservation time left + recent warm-up progress |
+| `nct-cooldown <alias>` | Clear the reservation, then scale the alias to zero (`nct <alias>` is a back-compat alias) |
 | `nct-demo` | Print the walkthrough above |
 
 > **How the switch works**: the client always sends `ANTHROPIC_MODEL=general`. SmartRouter pre-flights the target alias's vLLM NLB `/health` (~2s) **before** calling Higress. If cold (0 healthy targets) it bypasses the gateway and falls back directly to Bedrock Seoul (boto3, native Anthropic Messages); if warm it goes the normal Higress→vLLM path. A reactive fallback (Bedrock-direct) is also kept as a safety net for gateway/vLLM errors. The same command compares both backends with no client-side code or model-name change.
+
+> **Why `nct-warmup` is reservation-based**: rather than calling the warm-up SFN directly, `nct-warmup` invokes **reserve-fn** (a DynamoDB reservation + a one-shot EventBridge Scheduler expiry). When the chosen duration elapses, the alias **auto-scales-to-zero** — so an idle GPU never lingers because someone forgot to stop it (g5.12xlarge ~$5.7/hr). `nct-cooldown` is the manual stop before expiry; it **clears the reservation rows first**, then scales to zero — reserve-fn only boots on a 0→1 reservation transition, so a leftover row would make the next `nct-warmup` silently no-op.
+
+### Verifying the warm-path `max_tokens` clamp (step by step)
+
+Confirms that while warm (vLLM), a large Claude Code `max_tokens` (32000 by default) does **not** overflow the model's context window into a vLLM 400 → Bedrock fallback, but is served **directly by vLLM**. (On a context-overflow 400, SmartRouter halves `max_tokens` and retries — iterative-halving clamp.)
+
+```bash
+# STEP 0 — connect (same as 1) above: Name tag → bash -l)
+
+# STEP 1 — confirm cold: Bedrock should answer right now
+nct-which 32000
+#   expect (cold): model=claude-3-5-sonnet-... (or haiku)  +  x-nct-fallback: bedrock-direct
+
+# STEP 2 — warm up (GPU boot, ~10 min)
+nct-warmup coding 1h
+nct-status                      # repeat until coding shows WARM
+
+# STEP 3 — verify warm: judge the backend by the HEADER only (model self-report is meaningless)
+nct-which 32000
+#   expect (warm): model=qwen35-27b  +  x-nct-fallback: (none) = vLLM-direct
+#   if x-nct-fallback: bedrock-direct appears → regression (please report)
+
+# STEP 4 — real claude CLI on a large task (confirm vLLM-direct via the header)
+claude --debug -p "Summarize the design tradeoffs of a large codebase in detail." 2>&1 \
+  | grep -i 'x-nct-fallback' \
+  && echo "↑ bedrock-direct means it fell back (defect)" \
+  || echo "no fallback header = vLLM-direct (correct)"
+
+# STEP 5 — stop billing when done (manual, before the reservation expires)
+nct-cooldown coding
+```
+
+> ⚠️ **Judge the backend by the `x-nct-fallback` header only.** Asking claude "who are you" is useless — its identity is injected via the system prompt, so even when Qwen serves the request it answers `claude-...`. Never trust the model self-report.
 
 ---
 
@@ -449,9 +546,22 @@ scripts/warmup-request.sh --alias all --duration 30m
 - Warm-up is orchestrated with Step Functions (up to 50 min timeout)
 
 ### Smart Routing & Bedrock-direct fallback
-- A `general` alias request is analyzed via prompt embedding → scenario detection → rewritten to `coding`/`math`/... model
+- A `general` alias request is classified via **regex keyword counting** (no LLM, no embeddings) → scenario detection → rewritten to `coding`/`math`/... model. No match → default = `coding`. (Multimodal and ultra-long inputs are decided before keywords. See *Routing flow* above and the [FAQ](#faq).)
 - Putting an alias directly in the `model` field makes SmartRouter pass it through (no scenario detection)
 - When a vLLM alias is cold, SmartRouter detects it via a pre-flight and falls back directly to Bedrock (native Anthropic Messages, boto3), bypassing the gateway. A reactive fallback also covers gateway/vLLM errors
+- **Warm-path `max_tokens` clamp (2 stages)** — vLLM **strictly** enforces `input_tokens + max_tokens ≤ maxModelLen` (a request that overshoots is rejected with HTTP 400). Claude Code sends a large fixed `max_tokens` (observed 32000) on every turn, which exceeds the window of the smaller models (e.g. `coding`=Qwen3.5-27B maxModelLen 32768), so a **warm alias 400s and silently falls back to Bedrock** (the user sees a Haiku answer even though the GPU is up — a 2026-06 incident). SmartRouter blocks this in two stages:
+  1. **Preemptive clamp** — **before** the gateway POST, trim `max_tokens` to `min(requested, maxModelLen − reserve)` (floored). This is a first-stage filter for the common short-prompt + huge-max_tokens case with no round-trip. The reserve is a fixed headroom (`VLLM_INPUT_TOKEN_RESERVE`, default 8192) that avoids a tokenizer dependency.
+  2. **Reactive iterative halving** — when the real input exceeds the reserve (Claude Code's system+tools+multi-turn context routinely lands at 8k–24k+), the preemptive clamp alone still leaves `input+output>window` and vLLM 400s. SmartRouter then **halves `max_tokens` and retries** the gateway (up to `VLLM_RECLAMP_MAX_RETRIES`=6, floored at `VLLM_MIN_OUTPUT_TOKENS`=1024). Each 400 is a fast validation reject with no generation (~50ms), so it usually converges in 1–2 retries to `input+max_tokens≤window`. Tokenizer-free and model-agnostic (vLLM's reported input-token count is the lower bound `window−max_tokens+1`, not the real input, so it is unreliable — we converge by halving instead of parsing it). Only an input so large that even the floor output won't fit (worst on small-window models) falls through to the Bedrock fallback (safety net preserved).
+  - Per-alias windows are injected via `VLLM_MAX_MODEL_LEN` (a JSON map built from `VLLM_MODELS` in `config/models.ts`); an unmapped alias disables the clamp (safe no-op). The reactive retry can be disabled with `VLLM_RECLAMP_RETRY=false`.
+
+#### Cold-start availability: cascade + 504 churn prevention
+The cold fallback exists to give a best-effort in-region answer *while the vLLM model spins up* (availability over quality). Two mechanisms support this:
+
+- **Cascading in-region fallback (default Sonnet 3.5 → Haiku 3)** — when the primary fallback model hits a transient capacity throttle (`ServiceUnavailableException: Too many connections`), SmartRouter transparently cascades to the secondary model. The two models sit in **separate on-demand capacity pools** (RPM quotas 50 vs 400 — an 8× difference), so when one is saturated the other often has headroom. Both are Seoul (`ap-northeast-2`) IN_REGION, preserving the NCT (all-inference-domestic) constraint. The cascade fires only on throttle-class errors (`ServiceUnavailableException`/`ThrottlingException`/`TooManyRequestsException`); any other (e.g. malformed) error returns immediately. It applies to both the non-stream and stream paths; on the stream path each model is attempted before any frame is queued, so a throttled primary never leaks a partial stream.
+  - **Order = quality vs availability (deploy-time configurable)**: the default is **quality-first = Sonnet 3.5 primary**. This gateway exists for accuracy, so the cold safety net tries the higher-quality model first. ⚠️ Trade-off (measured 2026-06-14): the Seoul Sonnet 3.5 on-demand pool was ~93% throttled vs Haiku 3 ~43% (RPM 400, 8× larger pool), so Sonnet primary means a cold request can spend **16–93 s (sometimes timing out)** on botocore adaptive-retry backoff, while Haiku primary is **4–6 s**. We accept the slower cold start for quality by default. If cold-start **latency** matters more, deploy with `-c coldFallbackOrder=availability` to make Haiku 3 the primary (default is `quality`). For fast AND high-quality, warm up the vLLM alias so the self-hosted model serves directly.
+  - Env vars: `BEDROCK_FALLBACK_MODEL_ID` (primary), `BEDROCK_FALLBACK_MODEL_ID_SECONDARY` (secondary; empty disables the cascade). bin injects `config/models.ts`'s `BEDROCK_MODELS[0]`/`[1]` (default quality=Sonnet/Haiku) or the reverse, depending on the `coldFallbackOrder` context.
+  - ⚠️ Claude 3 Haiku has an EOL date (check the Bedrock console); update `config/models.ts` once a successor (e.g. Haiku 3.5) is available Seoul IN_REGION. If the pools' throttle rates change, revisit the default order.
+- **Streaming 504 churn prevention** — a cold→Bedrock streaming fallback that emitted zero bytes during a throttle backoff used to let the fronting ALB's idle timeout fire a 504 (the 2026-06 incident). Three guards prevent it: (1) SSE keepalive pings (`BEDROCK_KEEPALIVE_SECS`, default 10s) keep bytes flowing while waiting for a slot or the first byte so the ALB idle timer resets; (2) a concurrency semaphore (`BEDROCK_MAX_CONCURRENCY`, default 3) serializes a burst to reduce the "Too many connections" throttle at the source; (3) boto3 adaptive retries (`BEDROCK_MAX_ATTEMPTS`, default 8) plus a 180s ALB idle timeout.
 
 ### Higress Anthropic ↔ OpenAI conversion
 - Claude Code sends Anthropic-only params (`thinking`, `betas`, `anthropic_version`) to `/v1/messages`
@@ -552,6 +662,57 @@ Measured from an in-VPC client against the gateway entry point (`gateway.nct-gat
 
 [higress#3809]: https://github.com/alibaba/higress/issues/3809
 
+### Automated self-test harness (`scripts/system-test.sh`)
+
+A harness that self-tests every path of a deployed environment with automatic PASS/FAIL judgment, no human in the loop. It runs **inside the in-VPC test client EC2** (NctTestClientStack), where the gateway env (`ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`), CA trust, and Step Functions ARNs are already set up. Exit code = number of FAILs (0 = all pass); SKIP is not a failure.
+
+```bash
+# SSM into the test client — look it up by the Name tag (nct-test-client)
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters "Name=tag:Name,Values=nct-test-client" \
+                 "Name=instance-state-name,Values=running" \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
+# After connecting, ★ bash -l is required (loads gateway env)
+
+# No-cost dimensions only (S-cold, S-cascade, S-reservation, S-admin)
+./scripts/system-test.sh
+
+# + GPU dimensions (S-warm, S-permodel) — billed! scales to zero right after
+./scripts/system-test.sh --with-gpu
+
+# A single dimension / a report file
+./scripts/system-test.sh --only cold
+./scripts/system-test.sh --report /tmp/report.md
+```
+
+| Dimension | What it verifies | Cost |
+|-----------|------------------|------|
+| **S-cold** | vLLM scale-0 → Bedrock-direct fallback. non-stream/stream 200 + `x-nct-fallback` header + model=Sonnet\|Haiku + **504 churn regression guard** (stream lifecycle completes) | free |
+| **S-cascade** | primary throttle → secondary cascade (direction follows the deploy's `coldFallbackOrder`; default Sonnet→Haiku). **Deterministic** with a fault-injection deploy (below); otherwise best-effort observation | free |
+| **S-warm** | `coding` warm-up → vLLM direct. 200 + model=qwen + no fallback header + tool_use + streaming + **`max_tokens=32000` clamp regression guard** (a warm request that falls back to Bedrock = FAIL) + **real claude CLI e2e** (confirms vLLM-direct via the `--debug` response header). Scales to zero after | GPU (`--with-gpu`) |
+| **S-permodel** | each of the 6 aliases warm→route check→cooldown (serial, no concurrent GPUs). gated (longcontext/math) SKIP when HF license unapproved | GPU (`--with-gpu`) |
+| **S-reservation** | warm-up/cooldown Step Functions reachability | free |
+| **S-admin** | admin console (HTML-only) — substituted by SFN status | free |
+
+**Deterministic S-cascade** — a real throttle cannot be forced live, so deploying the gateway in fault-injection mode lets a synthetic throttle exercise the cascade deterministically (test-only, default OFF — on a production deploy, omitting `faultInjection` makes the test header ignored, so there is no test surface at all):
+
+```bash
+# Fault-injection deploy (preserve env: pass higress/vllm/operatorRole together)
+cdk deploy --exclusively NctSmartRouterStack -c faultInjection=true \
+  -c higressEndpoint=<NLB> -c vllmEndpoints='{...6 aliases...}' -c operatorRoleArns='[...]'
+
+# Then the x-nct-test-throttle-primary: 1 header forces a primary throttle → Haiku cascade
+./scripts/system-test.sh --only cascade
+```
+
+> ⚠️ When injecting the script via SSM run-command, pass it as base64 to avoid inline quoting pitfalls (parentheses / JSON):
+> ```bash
+> b64=$(base64 -w0 scripts/system-test.sh)
+> aws ssm send-command --instance-ids <i-...> --document-name AWS-RunShellScript \
+>   --parameters "commands=[\"echo $b64 | base64 -d > /tmp/system-test.sh\",\"bash -l /tmp/system-test.sh --only cascade\"]"
+> ```
+
 </details>
 
 <details>
@@ -564,6 +725,38 @@ Measured from an in-VPC client against the gateway entry point (`gateway.nct-gat
 | — | Bedrock model EOL | Update the alias to a Seoul IN_REGION successor; check EOL dates in the Bedrock console |
 
 </details>
+
+---
+
+## FAQ
+
+**Q. Which model answers a generic question?**
+`coding` (Qwen3.5-27B). A `model:general` request is classified by SmartRouter's `detect_scenario()`; when no math/coding/ocr keyword matches, the **default is `coding`** (the strongest general-purpose model). So miscellaneous questions ("what's the weather", "summarize this") all route to the `coding` alias — provided it's warm (if cold, see Q2 → Bedrock).
+
+**Q. If a `math` question comes in but `math` isn't warmed up, does Bedrock Sonnet 3.5 answer?**
+Yes — **by default Sonnet 3.5 answers** (cascading to Haiku 3 only on throttle). Exact flow: heavy math keywords make SmartRouter pick the `math` alias → if the `math` vLLM is cold (0 replicas), the pre-flight detects it → it bypasses Higress and answers from the **scenario-agnostic common in-region Bedrock fallback** (default primary = Sonnet 3.5, cascading to Haiku 3 on throttle). **Key point**: the fallback target is *not a math-specific Bedrock model* — it's the **same common Bedrock** for any cold alias. So it's not "math is cold so we use a math-like Bedrock" but "any cold vLLM alias is served by the same in-region Bedrock (Sonnet→Haiku)." Warm `math` ahead of time (`nct-warmup math`) and Gemma 4 31B (vLLM) answers directly.
+
+**Q. Can I change the cold-fallback order (Sonnet vs Haiku first)? And why is Sonnet the default?**
+**You can, and the default is quality-first (Sonnet 3.5 primary → Haiku 3 secondary).** This gateway exists for accuracy/quality (it self-hosts Qwen to recover ~82% of frontier coding) — not speed — so the cold safety net defaults to the higher-quality model first, cascading to Haiku 3 only when Sonnet throttles.
+
+There is a **trade-off**, though — measured on the Seoul on-demand pools (2026-06), Sonnet 3.5 was **~93% throttled** (`Too many connections`) vs Haiku 3 **~43%** (a separate pool, RPM 400 = 8× Sonnet's 50). So with Sonnet primary a cold request can spend **16–93s (sometimes timing out)** on retry backoff, vs **4–6s** with Haiku primary. **We accept the slower cold start for higher quality by default.**
+
+A customer who values cold-start **latency** over quality can flip the order at deploy time (no source edit):
+
+```bash
+cdk deploy ... -c coldFallbackOrder=availability   # → Haiku 3 primary, Sonnet 3.5 secondary
+# default is -c coldFallbackOrder=quality (Sonnet primary)
+```
+
+Either way both models are Seoul IN_REGION, so NCT (all inference in-country) holds. **For fast AND high-quality**, warm up the vLLM alias (`nct-warmup`) and get the self-hosted model directly (e.g. coding=Qwen3.5-27B, ~82% of frontier) — the cold path is only a best-effort safety net while vLLM spins up. (Haiku 3 has an EOL date — check the Bedrock console and update `config/models.ts`.)
+
+**Q. Claude Code says "I'm Anthropic's Claude" — so did Claude actually do the inference?**
+**No — a model's self-description is not a backend signal.** The Claude Code CLI **injects** a "you are Claude Code" identity into the system prompt, so whether Qwen or Haiku did the inference, the model parrots that injected identity. Ask "who are you" and Qwen will confidently answer "I'm Claude" (it doesn't know it's Qwen). The **real backend is determined only by the response header (`x-nct-fallback`) and SmartRouter logs**:
+- no header + `model: qwen35-27b` → vLLM (Qwen) answered.
+- `x-nct-fallback: bedrock-direct` + `model: claude-3-haiku...` → Bedrock answered (cold).
+
+**Q. Does routing classification use an LLM or embeddings?**
+No. `detect_scenario()` is **pure regex keyword counting** (`re.findall()` counts math/coding/ocr word frequency and picks the top scorer). There is no embedding similarity and no LLM classifier — lightweight and deterministic, but coarse (e.g. "solve the equation in this function" ties coding vs math). Only multimodal (audio/video) and ultra-long (longcontext) inputs are decided before keywords.
 
 ---
 

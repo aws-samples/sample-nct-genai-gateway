@@ -24,10 +24,20 @@ export interface SmartRouterStackProps extends cdk.StackProps {
    * Bedrock-direct fallback target. When the gateway (Higress) is unreachable or returns
    * an error on /v1/messages, the router bypasses the gateway and calls Bedrock's native
    * Anthropic endpoint directly (Higress ai-proxy 2.0.0 mis-signs SigV4 for Bedrock's
-   * /v1/messages — higress#3809). Defaults to the first BEDROCK_MODELS entry (the Claude
-   * Code CLI Sonnet target). The router uses the ECS task role's credential chain.
+   * /v1/messages — higress#3809). Defaults to the first BEDROCK_MODELS entry (Haiku 3 —
+   * the least-throttled Seoul on-demand pool; see config/models.ts). The router uses the
+   * ECS task role's credential chain.
    */
   bedrockFallbackModel?: BedrockModelConfig;
+  /**
+   * Secondary Bedrock-direct fallback target for a cascading in-region fallback. When the
+   * primary on-demand model momentarily saturates and throttles (`Too many connections`),
+   * the router transparently retries on this model, which has a separate on-demand capacity
+   * pool. Defaults to the second BEDROCK_MODELS entry (Sonnet 3.5 — higher quality but a
+   * heavily-throttled Seoul pool, hence the backup). Best-effort availability for the
+   * cold-start path. Set to skip by passing a model with an empty id.
+   */
+  bedrockFallbackModelSecondary?: BedrockModelConfig;
   /**
    * Per-alias vLLM internal NLB endpoints (the same `vllmEndpoints` map the Higress providers use).
    * When provided, the router does a fast /health pre-flight against the target alias's vLLM
@@ -37,6 +47,23 @@ export interface SmartRouterStackProps extends cdk.StackProps {
    * and the router relies solely on the reactive gateway fallback (the public-repo behaviour).
    */
   vllmEndpoints?: Record<string, string>;
+  /**
+   * Per-alias vLLM context window (maxModelLen) map. The router clamps an incoming
+   * `max_tokens` to fit `maxModelLen - reserve` before the gateway POST, so a warm alias
+   * accepts Claude Code's large fixed max_tokens (e.g. 32000) instead of 400-ing on
+   * `input + output > maxModelLen` and silently falling back to Bedrock (warm path bypassed).
+   * Empty (default) disables the clamp (no-op) — e.g. the public-repo default. Built from
+   * VLLM_MODELS in bin (alias → maxModelLen).
+   */
+  vllmMaxModelLen?: Record<string, number>;
+  /**
+   * TEST-ONLY fault injection. When true, the router honors the `x-nct-test-throttle-primary`
+   * request header by raising a SYNTHETIC throttle on the primary Bedrock model, forcing a
+   * deterministic, live cascade to the secondary (Haiku 3) — used by scripts/system-test.sh's
+   * S-cascade to verify the real end-to-end cascade. Defaults to false: on a production deploy
+   * the header is ignored entirely (no test surface). Set via `-c faultInjection=true`.
+   */
+  faultInjection?: boolean;
 }
 
 export class SmartRouterStack extends cdk.Stack {
@@ -61,16 +88,32 @@ export class SmartRouterStack extends cdk.Stack {
     });
 
     // Runtime task role — the router's boto3 bedrock-runtime client resolves credentials
-    // from this role (no static keys). Least-privilege: only InvokeModel* on the single
-    // fallback foundation model, in its region.
+    // from this role (no static keys). Least-privilege: only InvokeModel* on the fallback
+    // foundation models, in their region.
     const fallbackModel = props.bedrockFallbackModel ?? BEDROCK_MODELS[0];
     const bedrockRegion = fallbackModel.awsRegion ?? this.region;
+    // Cascading fallback: when the primary (Haiku 3) on-demand pool is momentarily saturated
+    // and throttles with `Too many connections`, the router retries on this secondary model
+    // (Sonnet 3.5). Haiku 3 and Sonnet 3.5 have SEPARATE on-demand capacity pools (RPM quotas
+    // 400 vs 50). Haiku is primary because the Seoul Sonnet pool is heavily throttled (~93%
+    // vs Haiku ~43%, measured 2026-06-14) — the cold path optimizes availability over quality.
+    // Best-effort in-region answer while the warm vLLM model spins up. Both Seoul IN_REGION (NCT).
+    const secondaryFallbackModel = props.bedrockFallbackModelSecondary ?? BEDROCK_MODELS[1];
     const taskRole = new iam.Role(this, 'TaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
+    const fallbackModelArns = [
+      `arn:aws:bedrock:${bedrockRegion}::foundation-model/${fallbackModel.bedrockModelId}`,
+    ];
+    if (secondaryFallbackModel) {
+      const secondaryRegion = secondaryFallbackModel.awsRegion ?? this.region;
+      fallbackModelArns.push(
+        `arn:aws:bedrock:${secondaryRegion}::foundation-model/${secondaryFallbackModel.bedrockModelId}`,
+      );
+    }
     taskRole.addToPolicy(new iam.PolicyStatement({
       actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
-      resources: [`arn:aws:bedrock:${bedrockRegion}::foundation-model/${fallbackModel.bedrockModelId}`],
+      resources: fallbackModelArns,
     }));
 
     // Build image from smart-router/Dockerfile — force amd64 for Fargate (Mac arm64 build host)
@@ -106,11 +149,22 @@ export class SmartRouterStack extends cdk.Stack {
         // Bedrock-direct fallback (gateway bypass on /v1/messages). Setting this enables
         // the fallback in router.py; the model + region match the IAM grant above.
         BEDROCK_FALLBACK_MODEL_ID: fallbackModel.bedrockModelId,
+        // Cascading secondary: retried on a primary throttle (separate on-demand pool).
+        BEDROCK_FALLBACK_MODEL_ID_SECONDARY: secondaryFallbackModel?.bedrockModelId ?? '',
         AWS_REGION: bedrockRegion,
         // Per-alias vLLM NLB endpoints for the cold-vLLM pre-flight (router.py probes
         // /health here before the gateway; cold alias → straight to Bedrock, no ~40s hang).
         // Empty string disables the pre-flight (public-repo default: reactive fallback only).
         VLLM_ENDPOINTS: JSON.stringify(props.vllmEndpoints ?? {}),
+        // Per-alias maxModelLen for the warm-path max_tokens clamp (router.py): a large
+        // Claude-Code max_tokens is clamped to fit the target alias's context window so a
+        // warm vLLM alias serves it directly instead of 400-ing → Bedrock fallback. Empty
+        // map disables the clamp (no-op). reserve/floor tunable via the two envs below.
+        VLLM_MAX_MODEL_LEN: JSON.stringify(props.vllmMaxModelLen ?? {}),
+        // TEST-ONLY: enable the synthetic-throttle header so S-cascade can force a live
+        // Sonnet→Haiku cascade. Defaults to "false" → header ignored (production has no
+        // test surface). Toggled via `-c faultInjection=true` on the test deploy only.
+        BEDROCK_FAULT_INJECTION: props.faultInjection ? 'true' : 'false',
       },
       portMappings: [{ containerPort: 8080, name: 'router' }],
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'smart-router' }),
@@ -136,6 +190,12 @@ export class SmartRouterStack extends cdk.Stack {
       internetFacing: false,
       securityGroup: albSG,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      // The Bedrock-direct fallback streams keepalive pings so the streaming path never
+      // idles (router.py). But a NON-streaming cold fallback is one blocking call with no
+      // intermediate bytes; under load a long agentic generation can exceed the ALB's 60s
+      // default and surface a spurious 504. Raise the idle timeout to 180s as a backstop —
+      // still well under the router's 600s upstream read timeout.
+      idleTimeout: cdk.Duration.seconds(180),
     });
 
     const service = new ecs.FargateService(this, 'Service', {

@@ -12,7 +12,7 @@ import { ReservationStack, DAILY_WARMUP_RULE_NAME } from '../lib/stacks/reservat
 import { AdminConsoleStack } from '../lib/stacks/admin-console-stack';
 import { TestClientStack } from '../lib/stacks/test-client-stack';
 import { HigressStack } from '../lib/stacks/higress-stack';
-import { VLLM_MODELS } from '../config/models';
+import { VLLM_MODELS, BEDROCK_MODELS } from '../config/models';
 
 const app = new cdk.App();
 
@@ -70,6 +70,37 @@ const operatorRoleArns = getJsonContext<string[]>('operatorRoleArns', []);
 //   -c higressEndpoint=internal-xxx.elb.amazonaws.com   (host only, no scheme/port)
 // then redeploy NctSmartRouterStack to point it at the gateway.
 const higressEndpoint = (app.node.tryGetContext('higressEndpoint') ?? '').toString().trim();
+
+// faultInjection: TEST-ONLY. Enables the SmartRouter's synthetic-throttle header so the
+// system-test harness's S-cascade can force a deterministic, live primary→secondary cascade.
+// Defaults to false (production: no test surface). Set via `-c faultInjection=true`.
+const faultInjection = ['true', '1', 'yes'].includes(
+  (app.node.tryGetContext('faultInjection') ?? '').toString().toLowerCase(),
+);
+
+// coldFallbackOrder: which Bedrock model the cold path tries FIRST.
+//   'quality'      (DEFAULT) → Sonnet 3.5 primary, Haiku 3 secondary. Higher quality; the
+//                              Seoul Sonnet pool is more throttled so the cold start can be
+//                              slower (16–93 s) — accepted as the default since this gateway
+//                              optimizes for accuracy, not speed.
+//   'availability'           → Haiku 3 primary, Sonnet 3.5 secondary. Faster/less-throttled
+//                              pool (4–6 s) at lower quality. For customers who value cold-
+//                              start latency over quality.
+// Either way the two models are just BEDROCK_MODELS reordered; both stay Seoul IN_REGION (NCT).
+// Set via `-c coldFallbackOrder=availability`. For production-grade speed AND quality, warm up
+// the vLLM alias so the self-hosted model serves directly (the cold path is best-effort).
+const coldFallbackOrder = (app.node.tryGetContext('coldFallbackOrder') ?? 'quality')
+  .toString().toLowerCase();
+if (!['quality', 'availability'].includes(coldFallbackOrder)) {
+  throw new Error(
+    `coldFallbackOrder must be 'quality' or 'availability', got '${coldFallbackOrder}'`,
+  );
+}
+// BEDROCK_MODELS defaults to quality-first ([0]=Sonnet, [1]=Haiku). 'availability' swaps them.
+const [bedrockPrimary, bedrockSecondary] =
+  coldFallbackOrder === 'availability'
+    ? [BEDROCK_MODELS[1], BEDROCK_MODELS[0]]
+    : [BEDROCK_MODELS[0], BEDROCK_MODELS[1]];
 
 const networkStack = new NetworkStack(app, 'NctNetworkStack', { env, clusterName });
 
@@ -150,6 +181,21 @@ const smartRouterStack = new SmartRouterStack(app, 'NctSmartRouterStack', {
   // gateway when the target alias is scaled to zero). Empty when vllmEndpoints is omitted
   // → pre-flight disabled, reactive fallback only (the public-repo default).
   vllmEndpoints,
+  // Per-alias context window (alias → maxModelLen) for the router's warm-path max_tokens
+  // clamp: a large Claude-Code max_tokens is clamped to fit the target model's window so a
+  // warm alias serves it on vLLM instead of 400-ing → Bedrock fallback. Derived from the
+  // same VLLM_MODELS config the vLLM stacks use (always populated; clamp is a safe no-op
+  // for any alias the router doesn't have a length for).
+  vllmMaxModelLen: Object.fromEntries(
+    Object.values(VLLM_MODELS).map((m) => [m.alias, m.maxModelLen]),
+  ),
+  // Cold-fallback cascade order. Default quality-first (Sonnet primary → Haiku secondary);
+  // `-c coldFallbackOrder=availability` flips to Haiku primary → Sonnet secondary. See the
+  // coldFallbackOrder note above. Both stay Seoul IN_REGION (NCT preserved either way).
+  bedrockFallbackModel: bedrockPrimary,
+  bedrockFallbackModelSecondary: bedrockSecondary,
+  // TEST-ONLY synthetic-throttle surface for S-cascade (default OFF on production).
+  faultInjection,
 });
 
 // Phase 9: Step Functions warm-up/cool-down SFN machines
@@ -213,11 +259,16 @@ if (deployTestClient) {
     masterKeySecret: higressStack.masterKeySecret,
     warmupSfnArn:   warmupStack.warmupMachine.stateMachineArn,
     cooldownSfnArn: warmupStack.cooldownMachine.stateMachineArn,
+    // nct-warmup places a timed reservation via reserve-fn (auto-cooldown at expiry);
+    // nct-status/nct-cooldown read/clear its rows in the reservations table.
+    reserveFnArn: reservationStack.reserveFnArn,
+    reservationsTableName: 'NctWarmupReservations',
     caCertSecretName: '/nct/gateway/ca-cert',
     clusterName,
   });
   testClientStack.addDependency(higressStack);
   testClientStack.addDependency(warmupStack);
+  testClientStack.addDependency(reservationStack);
   testClientStack.addDependency(certStack);
   testClientStack.addDependency(dnsStack);
 }

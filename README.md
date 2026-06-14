@@ -27,8 +27,12 @@ AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 # [2] 후처리 — NLB DNS 조회 → SmartRouter 재배선 → Higress 구성 적용
 ./scripts/finalize-deploy.sh
 
-# [3] 체험 — VPC 안 테스트 클라이언트(EC2 + Claude Code)에 SSM 접속
-aws ssm start-session --target <NctTestClientStack 의 InstanceId>
+# [3] 체험 — VPC 안 테스트 클라이언트(EC2 + Claude Code)에 SSM 접속 (Name 태그로 조회)
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters Name=tag:Name,Values=nct-test-client Name=instance-state-name,Values=running \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
+bash -l                              # ★ gateway env 로드
 
 # [4] 테스트 — cold 면 Bedrock(Seoul); `nct-warmup coding` 후 같은 명령이 vLLM(Qwen3.5)로
 claude "이 함수를 읽기 좋게 리팩터링해줘: ..."
@@ -84,6 +88,54 @@ Reservation(EventBridge + Lambda + DynamoDB + Step Functions)이
 평일 08:30–19:30 KST 스케줄로 vLLM warmup/cooldown을 제어합니다. 전 구간이 단일 리전(Seoul) 안에서 동작합니다.
 
 > 편집 가능한 원본: [`docs/architecture/nct-architecture.drawio`](docs/architecture/nct-architecture.drawio) (draw.io)
+
+### 라우팅 흐름 (2단계)
+
+요청은 **두 단계**로 백엔드에 도달합니다. 흔히 오해하듯 *Higress가 내용을 보고 라우팅하는 게 아니라*, 그 앞단 **SmartRouter**가 내용 기반으로 alias를 정하고, **Higress는 그 alias 이름만 보고** 백엔드를 매칭합니다.
+
+```mermaid
+flowchart TD
+    C["연구원 · Claude Code CLI<br/>model: general"]
+    C -->|"HTTPS 443 · Anthropic Messages"| SR
+
+    subgraph SR["① SmartRouter (ECS Fargate) — 내용 기반"]
+        DET["detect_scenario()<br/>정규식 키워드 카운트<br/>(LLM·임베딩 미사용)<br/>매칭 0이면 default = coding"]
+        CLAMP["max_tokens clamp<br/>(window 초과분 선제 축소)"]
+        DET --> CLAMP
+    end
+
+    SR --> PF{"target alias vLLM<br/>/health pre-flight (~2s)"}
+    PF -->|"cold (0 replica)"| BR
+    PF -->|"warm"| HG
+
+    subgraph HG["② Higress AI Gateway (EKS) — 이름 매칭"]
+        EQ["model 이름 EQUAL 매칭 (내용 안 봄)<br/>alias → vLLM serving name 재작성"]
+    end
+
+    HG -->|"200"| VL["vLLM × 6 (EKS Auto Mode, scale-to-zero)<br/>coding·video=Qwen3.5-27B · ocr=InternVL3<br/>math=Gemma4 · longcontext=Llama4 · audio=Phi-4"]
+    HG -->|"4xx/5xx<br/>(context overflow → max_tokens 반감 재시도)"| BR
+
+    subgraph BR["Bedrock-direct fallback (boto3, gateway 우회)"]
+        SN["Claude 3.5 Sonnet — primary (default, quality-first)"]
+        HK["Claude 3 Haiku — secondary"]
+        SN -->|"throttle 시에만 cascade"| HK
+    end
+
+    VL --> SEOUL(["전 구간 Seoul ap-northeast-2 내 — NCT 보존"])
+    BR --> SEOUL
+```
+
+**① SmartRouter — 내용 기반 alias 결정 (LLM 안 씀).** `model:general` 요청이 오면 `detect_scenario()`가 prompt를 분석해 6개 alias 중 하나로 정합니다. 추론 LLM이나 임베딩 유사도가 아니라 **순수 정규식 키워드 카운트**입니다:
+- 멀티모달은 즉답 — content에 `audio/*` 블록 → `audio`, `video/*` → `video`.
+- 텍스트 60,000자 초과 → `longcontext`.
+- 나머지는 `math`/`coding`/`ocr` 3개 정규식의 **매칭 단어 수**를 세어 최다 득점 alias 선택.
+- **전부 0점이면 default = `coding`** (Qwen3.5-27B가 범용으로 가장 강하므로). → 일반/잡다한 질문은 모두 `coding`으로 갑니다.
+
+이미 `model:coding`처럼 alias를 직접 지정하면 `detect_scenario`를 건너뛰고 그대로 통과합니다.
+
+**② Higress — alias 이름만 매칭 (dumb router).** SmartRouter가 `model` 필드를 결정된 alias로 재작성해 보내면, Higress는 내용을 다시 보지 않고 `modelPredicates`의 **EQUAL(정확 일치)** 로 route를 고른 뒤, provider의 `modelMapping`으로 alias를 실제 vLLM serving 이름(예: `coding`→`qwen35-27b`)으로 한 번 더 바꿔 upstream에 전달합니다.
+
+**Fallback은 Higress가 아니라 SmartRouter가 소유.** vLLM route에는 cross-provider fallback이 **의도적으로 없습니다**(Higress ai-proxy 2.0.0이 Bedrock `/v1/messages` SigV4를 오서명 — [higress#3809](https://github.com/alibaba/higress/issues/3809)). 대신 SmartRouter가 두 겹으로 처리합니다: (1) **pre-flight** — 대상 alias vLLM이 cold(0 replica)면 Higress를 건너뛰고 곧장 Bedrock-direct, (2) **reactive** — Higress가 4xx/5xx를 내면(예: context-window 초과 400 → `max_tokens`를 절반씩 줄여 재시도) 그래도 안 되면 Bedrock-direct. 어느 경로든 fallback 대상은 **scenario와 무관한 공통 in-region Bedrock**(default Sonnet→Haiku, `-c coldFallbackOrder`로 전환 가능)이지, math 전용·coding 전용 Bedrock이 따로 있는 게 아닙니다. 자세한 동작은 아래 [FAQ](#faq)를 참고하십시오.
 
 ---
 
@@ -153,17 +205,19 @@ AWS_DEFAULT_REGION=ap-northeast-2 cdk deploy --all
 배포에는 **VPC 안 테스트 클라이언트(EC2 1대)가 기본 포함**됩니다 — Claude Code가 미리 설치·연결된 채 부팅되고 **SSM Session Manager로만** 접속합니다. 게이트웨이를 손으로 바로 체험할 수 있습니다(상세는 [Try it](#try-it-in-vpc-테스트-클라이언트-기본-포함)).
 
 ```bash
-# [3] SSM 접속 — InstanceId 는 NctTestClientStack output
-INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name NctTestClientStack \
-  --region ap-northeast-2 \
-  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
-aws ssm start-session --target "$INSTANCE_ID" --region ap-northeast-2
+# [3] SSM 접속 — Name 태그(nct-test-client)로 조회. (CloudFormation output 으로도 가능:
+#     aws cloudformation describe-stacks --stack-name NctTestClientStack --query ...InstanceId)
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters Name=tag:Name,Values=nct-test-client Name=instance-state-name,Values=running \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
+bash -l                  # ★ gateway env 로드 (그냥 bash 금지)
 
 # [4] cold 면 Bedrock(Seoul). nct-warmup coding 후엔 같은 명령이 vLLM(Qwen3.5)로
 claude "이 함수를 읽기 좋게 리팩터링해줘: ..."
-nct-warmup coding        # GPU 기동(수 분), nct-status 로 폴링
+nct-warmup coding 2h     # 시간 지정 예약(만료 시 자동 cooldown). nct-status 로 폴링
 claude "이 함수를 읽기 좋게 리팩터링해줘: ..."   # 이제 vLLM 직접
-nct coding               # 끝나면 scale-to-zero (GPU 과금 정지)
+nct-cooldown coding      # 끝나면 예약 해제 + scale-to-zero (GPU 과금 정지)
 
 # [5] 데모 종료 — 전체 스택 삭제
 cdk destroy --all --force
@@ -261,35 +315,78 @@ cdk deploy --all -c deployTestClient=false
 핵심은 **같은 명령으로 cold/warm을 비교**하는 것입니다. 클라이언트는 model 하나(`general`)만 고정하고, 전환은 SmartRouter의 자동 fallback이 처리합니다:
 
 ```bash
-# 1) SSM으로 접속 (인스턴스 ID는 NctTestClientStack output)
-aws ssm start-session --target <instance-id> --region ap-northeast-2
+# 1) SSM으로 접속 — 인스턴스 ID 하드코딩 대신 Name 태그로 조회
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters "Name=tag:Name,Values=nct-test-client" \
+                 "Name=instance-state-name,Values=running" \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
 
-# 안내 보기
+# 접속 후 — ★ bash -l 필수 (gateway env 로드). 그냥 bash 는 env 가 안 실린다.
+bash -l
+
+# 안내 보기 / 지금 어느 백엔드가 답하는지 확인
 nct-demo
+nct-which                 # model + x-nct-fallback 헤더 (cold=bedrock-direct, warm=qwen, 헤더 없음)
 
 # 2) warm-up 전 (GPU cold): vLLM alias가 0 replica → SmartRouter가 cold를 감지해
 #    in-region Bedrock(Claude 3.5 Sonnet, 서울)으로 직접 fallback
 claude "이 함수를 읽기 좋게 리팩터링해줘: ..."
 
-# 3) GPU 모델 기동 (수 분 소요, nct-status로 폴링)
-nct-warmup coding
-nct-status          # SUCCEEDED = 준비 완료
+# 3) GPU 모델 기동 (수 분 소요, nct-status로 폴링) — 시간 지정 시 만료에 자동 cooldown
+nct-warmup coding 2h      # 2h / 90m / 3600(초) · 미지정 시 1h
+nct-status                # coding 이 WARM (reserved, ~Nm left) 으로 뜨면 준비 완료
 
 # 4) warm-up 후: 똑같은 명령이 이제 self-host Qwen3.5-27B(vLLM)로 라우팅
 claude "이 함수를 읽기 좋게 리팩터링해줘: ..."
 
-# 5) 끝나면 GPU 과금 정지
-nct coding          # 해당 alias를 0 replica로 복귀
+# 5) 끝나면 GPU 과금 정지 (만료 전 수동 정지)
+nct-cooldown coding       # 예약 해제 + 해당 alias를 0 replica로 복귀
 ```
 
 | 헬퍼 | 동작 |
 |------|------|
-| `nct-warmup <alias>` | alias의 vLLM deployment를 기동 (Warmup SFN) |
-| `nct-status` | 최근 warm-up 실행 상태 (RUNNING→SUCCEEDED) |
-| `nct <alias>` | alias를 scale-to-zero로 복귀 (Cooldown SFN) |
+| `nct-which [max_tokens]` | 지금 `coding`에 답하는 백엔드 확인 (model + `x-nct-fallback` 헤더) |
+| `nct-warmup <alias> [기간]` | **시간 지정 예약**으로 alias 기동 (`2h`/`90m`/`3600`, 기본 1h). 만료 시 자동 cooldown |
+| `nct-status` | alias별 warm/cold + 예약 잔여 시간 + 최근 warm-up 진행 상태 |
+| `nct-cooldown <alias>` | 예약 해제 후 alias를 scale-to-zero (`nct <alias>`는 하위호환 alias) |
 | `nct-demo` | 위 시나리오 안내 출력 |
 
 > **자동 전환 원리**: 클라이언트는 항상 `ANTHROPIC_MODEL=general`을 보냅니다. SmartRouter는 Higress로 보내기 **전에** 해당 alias의 vLLM NLB `/health`를 ~2s로 pre-flight 합니다. cold(healthy target 0)면 gateway를 건너뛰고 곧장 Bedrock Seoul로 직접 fallback(boto3, Anthropic Messages native)하고, warm이면 Higress→vLLM 정상 경로로 갑니다. gateway나 vLLM이 에러를 반환하는 경우에도 reactive fallback(Bedrock-direct)이 안전망으로 동작합니다. 클라이언트 코드·모델명 변경 없이 동일 명령으로 두 백엔드를 비교 체험할 수 있습니다.
+
+> **`nct-warmup`이 예약(reservation) 기반인 이유**: `nct-warmup`은 warm-up SFN을 직접 부르지 않고 **reserve-fn**(DynamoDB 예약 + EventBridge Scheduler 1회성 만료)을 호출합니다. 따라서 지정한 기간이 지나면 **자동으로 scale-to-zero** 되어, 끄는 걸 잊어도 GPU가 무한정 켜져 있지 않습니다(g5.12xlarge ~$5.7/hr 방지). `nct-cooldown`은 만료 전 수동 정지용이며, **예약 행을 먼저 지운 뒤** scale-0 합니다 — reserve-fn은 예약 0→1 전환에서만 기동하므로, 남은 예약 행이 있으면 다음 `nct-warmup`이 조용히 무시될 수 있기 때문입니다.
+
+### warm-path `max_tokens` clamp 검증 (단계별)
+
+warm(vLLM) 상태에서 Claude Code가 보내는 큰 `max_tokens`(기본 32000)가 모델 context window를 넘어 vLLM 400 → Bedrock 폴백으로 새지 않고, **vLLM이 직접** 답하는지 확인하는 절차입니다. (SmartRouter가 context-overflow 400을 만나면 `max_tokens`를 절반씩 줄여 재시도하는 iterative-halving clamp를 적용합니다.)
+
+```bash
+# STEP 0 — 접속 (위 1) 과 동일, Name 태그 → bash -l)
+
+# STEP 1 — cold 확인: 지금은 Bedrock 이 답해야 정상
+nct-which 32000
+#   기대(cold): model=claude-3-5-sonnet-... (또는 haiku)  +  x-nct-fallback: bedrock-direct
+
+# STEP 2 — warmup (GPU 기동, ~10분)
+nct-warmup coding 1h
+nct-status                      # coding 이 WARM 으로 뜰 때까지 반복
+
+# STEP 3 — warm 검증: 백엔드 판별은 헤더로만 (모델 자백 무효)
+nct-which 32000
+#   기대(warm): model=qwen35-27b  +  x-nct-fallback: (none) = vLLM-direct
+#   혹시 x-nct-fallback: bedrock-direct 가 뜨면 → 회귀 (보고 요망)
+
+# STEP 4 — 실제 claude CLI 로 큰 작업(헤더로 vLLM-direct 확인)
+claude --debug -p "Summarize the design tradeoffs of a large codebase in detail." 2>&1 \
+  | grep -i 'x-nct-fallback' \
+  && echo "↑ bedrock-direct 보이면 폴백(결함)" \
+  || echo "fallback 헤더 없음 = vLLM-direct (정상)"
+
+# STEP 5 — 끝나면 비용 정지 (예약 만료 전 수동)
+nct-cooldown coding
+```
+
+> ⚠️ **백엔드 판별은 `x-nct-fallback` 헤더로만** 합니다. claude에게 "너 누구냐"고 물어도 정체성이 system prompt에 주입돼 있어 Qwen이 답해도 `claude-...`라고 답합니다 — 모델 자백은 신뢰하지 마십시오.
 
 ---
 
@@ -449,9 +546,22 @@ scripts/warmup-request.sh --alias all --duration 30m
 - Warm-up은 Step Functions로 오케스트레이션 (I7 수정: 최대 50분 timeout)
 
 ### Smart Routing & Bedrock-direct fallback
-- `general` alias 요청 시 prompt embedding 분석 → scenario 감지 → `coding`/`math`/... 모델로 재작성
+- `general` alias 요청 시 **정규식 키워드 카운트**(LLM·임베딩 미사용)로 scenario 감지 → `coding`/`math`/... 모델로 재작성. 매칭 0이면 default = `coding`. (멀티모달·초장문만 키워드 전에 우선 판정. 상세는 위 *라우팅 흐름* 및 [FAQ](#faq).)
 - `model` 필드에 alias를 직접 지정하면 SmartRouter가 그대로 통과(scenario 감지 생략)
 - vLLM alias가 cold면 SmartRouter가 pre-flight로 감지 → Higress를 우회하고 Bedrock(Anthropic Messages native, boto3)으로 직접 fallback. gateway/vLLM 에러 시에도 reactive fallback이 안전망
+- **Warm-path `max_tokens` clamp (2단계)** — vLLM은 `input_tokens + max_tokens ≤ maxModelLen`을 **엄격히** 강제(초과 시 HTTP 400)합니다. Claude Code는 매 요청에 큰 고정 `max_tokens`(관측 32000)를 싣는데, 이는 작은 모델의 window(예: `coding`=Qwen3.5-27B maxModelLen 32768)를 넘겨 **warm alias가 400 → Bedrock으로 폴백**(warm인데 Haiku가 답하는) 결함을 일으켰습니다(2026-06 incident). SmartRouter가 두 단계로 막습니다:
+  1. **선제(preemptive) clamp** — gateway POST **전에** `max_tokens`를 `min(요청값, maxModelLen − reserve)`(floor 보장)로 줄입니다. 짧은 prompt + 큰 max_tokens라는 흔한 케이스를 round-trip 없이 잡는 1차 필터입니다. reserve는 tokenizer 의존을 피한 고정 여유(`VLLM_INPUT_TOKEN_RESERVE`, 기본 8192).
+  2. **반응형(reactive) iterative halving** — 실 입력이 reserve를 넘으면(Claude Code의 system+tools+멀티턴 누적은 흔히 8k~24k+) 선제 clamp만으론 여전히 `input+output>window`라 400이 납니다. 이때 SmartRouter가 `max_tokens`를 **절반씩 줄여 gateway에 재시도**(최대 `VLLM_RECLAMP_MAX_RETRIES`=6, floor `VLLM_MIN_OUTPUT_TOKENS`=1024)합니다. 각 400은 generation 없는 빠른 validation reject(~50ms)라 보통 1~2회로 `input+max_tokens≤window`에 수렴합니다. tokenizer 불필요·모델 무관(vLLM 400 메시지의 input-token 수는 `window−max_tokens+1` 하한값일 뿐 실측이 아니라 신뢰 불가 → 값 파싱 대신 halving으로 수렴). 입력이 window에 근접해 floor에서도 안 들어가는 극단(작은 window 모델)만 기존 Bedrock fallback이 받습니다(안전망 유지).
+  - alias별 window는 `VLLM_MAX_MODEL_LEN`(JSON map, `config/models.ts`의 `VLLM_MODELS`에서 생성)으로 주입하며, 맵에 없는 alias는 clamp 비활성(안전 no-op). 반응형 재시도는 `VLLM_RECLAMP_RETRY=false`로 끌 수 있습니다.
+
+#### Cold-start 가용성: cascade + 504 churn 차단
+cold fallback의 용도는 "vLLM이 기동되는 동안, 부족하나마 in-region Bedrock으로 즉답"입니다(품질 < 가용성, best-effort). 이를 위해 두 가지가 들어가 있습니다.
+
+- **Cascading in-region fallback (default Sonnet 3.5 → Haiku 3)** — primary fallback 모델이 일시적 capacity throttle(`ServiceUnavailableException: Too many connections`)을 맞으면, SmartRouter가 secondary 모델로 투명하게 cascade합니다. 두 모델은 **독립된 on-demand capacity 풀**(RPM 50 vs 400 — 8× 차이의 별도 풀)이라, 한쪽이 포화여도 다른 쪽은 여유가 있을 확률이 높습니다. 둘 다 Seoul(`ap-northeast-2`) IN_REGION이라 NCT(전 추론 국내) 제약을 보존합니다. throttle 계열 예외(`ServiceUnavailableException`/`ThrottlingException`/`TooManyRequestsException`)에서만 cascade하고, malformed 등 terminal 에러는 즉시 반환합니다. non-stream/stream 양 경로 모두 적용되며, streaming은 첫 frame을 큐잉하기 전에 모델별로 시도하므로 throttle된 primary가 부분 stream을 흘리지 않습니다.
+  - **순서 결정 = quality vs availability (deploy-time configurable)**: 기본은 **품질 우선 = Sonnet 3.5 primary**입니다. 이 게이트웨이의 본분이 정확도이므로 cold 안전망도 고품질을 먼저 시도합니다. ⚠️ trade-off (2026-06-14 측정): Seoul Sonnet 3.5 on-demand 풀이 ~93% throttle인 반면 Haiku 3 풀(RPM 400, 8× 큼)은 ~43%라, Sonnet primary는 cold 요청이 botocore adaptive-retry backoff로 **16~93초(때때로 timeout)**, Haiku primary는 **4~6초**입니다. 품질을 위해 느린 cold-start를 기본으로 감수합니다. cold **속도**가 더 중요하면 `-c coldFallbackOrder=availability`로 배포하면 Haiku 3가 primary가 됩니다(기본은 `quality`). 빠른 고품질이 필요하면 vLLM alias를 warm-up해 self-host 모델로 직접 받으십시오.
+  - 환경변수: `BEDROCK_FALLBACK_MODEL_ID`(primary), `BEDROCK_FALLBACK_MODEL_ID_SECONDARY`(secondary, 빈 값이면 cascade 비활성). bin이 `coldFallbackOrder` context에 따라 `config/models.ts`의 `BEDROCK_MODELS[0]`/`[1]`(default quality=Sonnet/Haiku) 또는 그 역순을 주입합니다.
+  - ⚠️ Claude 3 Haiku는 EOL 일정이 있으니(Bedrock 콘솔 확인), Seoul IN_REGION에서 후속(예: Haiku 3.5)이 가용해지면 `config/models.ts`의 primary를 갱신하십시오. 풀 용량(throttle 비율)이 바뀌면 primary/secondary 순서도 재검토하십시오.
+- **Streaming 504 churn 차단** — cold→Bedrock streaming fallback이 throttle backoff 동안 0 byte를 흘리면 fronting ALB의 idle timeout이 504를 발화하던 결함이 있었습니다(2026-06 incident). 세 가지 가드로 차단합니다: (1) SSE keepalive ping(`BEDROCK_KEEPALIVE_SECS`, 기본 10s) — slot 대기·첫 byte 지연 구간에도 bytes를 흘려 ALB idle timer를 리셋, (2) 동시성 semaphore(`BEDROCK_MAX_CONCURRENCY`, 기본 3) — burst를 직렬화해 "Too many connections" 자체를 줄임, (3) boto3 adaptive retry(`BEDROCK_MAX_ATTEMPTS`, 기본 8) + ALB idle timeout 180s.
 
 ### Higress Anthropic ↔ OpenAI 변환
 - Claude Code는 `thinking`, `betas`, `anthropic_version` 등 Anthropic 전용 파라미터를 `/v1/messages`로 전송
@@ -552,6 +662,57 @@ kubectl exec -n vllm <curl-pod> -- curl -sk https://<higress-nlb>:443/
 
 [higress#3809]: https://github.com/alibaba/higress/issues/3809
 
+### 자동 self-test 하네스 (`scripts/system-test.sh`)
+
+배포 환경 전(全)경로를 사람 없이 PASS/FAIL로 자동 판정하는 하네스입니다. **in-VPC 테스트 클라이언트 EC2**(NctTestClientStack) 안에서 실행하며, gateway env(`ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`)·CA trust·Step Functions ARN이 이미 셋업돼 있습니다. 종료 코드 = FAIL 개수(0=전부 통과), SKIP은 실패로 치지 않습니다.
+
+```bash
+# 테스트 클라이언트에 SSM 접속 — Name 태그(nct-test-client)로 조회
+aws ssm start-session --region ap-northeast-2 --target \
+  "$(aws ec2 describe-instances --region ap-northeast-2 \
+       --filters "Name=tag:Name,Values=nct-test-client" \
+                 "Name=instance-state-name,Values=running" \
+       --query 'Reservations[0].Instances[0].InstanceId' --output text)"
+# 접속 후 ★ bash -l 필수 (gateway env 로드)
+
+# 무비용 차원만 (S-cold, S-cascade, S-reservation, S-admin)
+./scripts/system-test.sh
+
+# + GPU 차원 (S-warm, S-permodel) — 과금! 검증 후 즉시 scale-0
+./scripts/system-test.sh --with-gpu
+
+# 특정 차원만 / 리포트 파일
+./scripts/system-test.sh --only cold
+./scripts/system-test.sh --report /tmp/report.md
+```
+
+| 차원 | 검증 내용 | 비용 |
+|------|-----------|------|
+| **S-cold** | vLLM scale-0 → Bedrock-direct fallback. non-stream/stream 200 + `x-nct-fallback` 헤더 + 모델=Sonnet\|Haiku + **504 churn 회귀 가드**(stream lifecycle 완결) | 무비용 |
+| **S-cascade** | primary throttle → secondary cascade (방향은 배포 `coldFallbackOrder`에 따름; default Sonnet→Haiku). fault-injection 배포 시 **결정적**(아래), 아니면 best-effort 관측 | 무비용 |
+| **S-warm** | `coding` warm-up → vLLM direct. 200 + 모델=qwen + fallback 헤더 없음 + tool_use + streaming + **`max_tokens=32000` clamp 회귀 가드**(warm인데 Bedrock 폴백이면 FAIL) + **실 claude CLI e2e**(`--debug` 응답 헤더로 vLLM-direct 확인). 검증 후 scale-0 | GPU(`--with-gpu`) |
+| **S-permodel** | 6 alias 각각 warm→라우팅 검증→cooldown(직렬, 동시 GPU 금지). gated(longcontext/math)는 HF 미승인 시 SKIP | GPU(`--with-gpu`) |
+| **S-reservation** | warm-up/cooldown Step Functions 도달성 | 무비용 |
+| **S-admin** | 관리 콘솔(HTML-only) — SFN status로 갈음 | 무비용 |
+
+**S-cascade 결정적 검증** — 라이브에서 실 throttle은 강제할 수 없으므로, gateway를 fault-injection 모드로 배포하면 합성 throttle로 cascade를 결정적으로 검증할 수 있습니다(테스트 전용, 기본 OFF — production 배포엔 `faultInjection` 생략 시 테스트 헤더가 무시되어 표면 자체가 없음):
+
+```bash
+# fault-injection 활성 배포 (env 보존: higress/vllm/operatorRole 함께 전달 필수)
+cdk deploy --exclusively NctSmartRouterStack -c faultInjection=true \
+  -c higressEndpoint=<NLB> -c vllmEndpoints='{...6 alias...}' -c operatorRoleArns='[...]'
+
+# 그러면 x-nct-test-throttle-primary: 1 헤더로 primary 합성 throttle → secondary cascade
+./scripts/system-test.sh --only cascade
+```
+
+> ⚠️ SSM run-command로 스크립트를 투입할 땐 인라인 quoting 함정(괄호·JSON)을 피하려 base64로 전달하십시오:
+> ```bash
+> b64=$(base64 -w0 scripts/system-test.sh)
+> aws ssm send-command --instance-ids <i-...> --document-name AWS-RunShellScript \
+>   --parameters "commands=[\"echo $b64 | base64 -d > /tmp/system-test.sh\",\"bash -l /tmp/system-test.sh --only cascade\"]"
+> ```
+
 </details>
 
 <details>
@@ -564,6 +725,38 @@ kubectl exec -n vllm <curl-pod> -- curl -sk https://<higress-nlb>:443/
 | — | Bedrock 모델 EOL | Seoul IN_REGION 후속 모델로 alias 갱신 필요. EOL 일정은 Bedrock 콘솔에서 확인 |
 
 </details>
+
+---
+
+## FAQ
+
+**Q. 일반적인(generic) 질문을 하면 어떤 모델이 답하나요?**
+`coding`(Qwen3.5-27B)이 답합니다. `model:general`로 들어온 요청을 SmartRouter의 `detect_scenario()`가 키워드로 분류하는데, math/coding/ocr 키워드가 하나도 안 잡히면 **default가 `coding`** 입니다 (Qwen3.5-27B가 범용으로 가장 강하므로). 즉 "오늘 날씨", "이 글 요약해줘" 같은 잡다한 질문도 전부 `coding` alias로 라우팅됩니다 — 단, 그 alias가 warm일 때 얘기입니다(cold면 아래 Q2처럼 Bedrock).
+
+**Q. `math` 질문이 들어왔는데 `math` 모델이 warm-up 안 돼 있으면 Bedrock Sonnet 3.5가 답하나요?**
+네 — **기본 설정에서는 Sonnet 3.5가 답합니다**(throttle 시에만 Haiku 3로 cascade). 정확한 흐름: 질문에 수학 키워드가 많으면 SmartRouter가 `math` alias로 정합니다 → `math` vLLM이 cold(0 replica)면 pre-flight가 감지 → Higress를 건너뛰고 **공통 in-region Bedrock fallback**(default primary=Sonnet 3.5, throttle 시 Haiku 3로 cascade)으로 직접 응답합니다. **중요**: fallback 대상은 *math 전용 Bedrock 모델*이 아니라 **scenario와 무관한 공통 Bedrock**입니다. 즉 "math가 cold라서 math 비슷한 Bedrock으로 간다"가 아니라, "vLLM 어느 alias든 cold면 동일한 in-region Bedrock(Sonnet→Haiku)이 받는다"입니다. `math`를 미리 `nct-warmup math`로 띄워두면 그때는 Gemma 4 31B(vLLM)가 직접 답합니다.
+
+**Q. cold fallback 순서(Sonnet vs Haiku 누가 먼저)는 바꿀 수 있나요? 왜 Sonnet이 기본인가요?**
+**바꿀 수 있고, 기본은 품질 우선(Sonnet 3.5 primary → Haiku 3 secondary)입니다.** 이 게이트웨이의 존재 이유 자체가 속도가 아니라 **정확도·품질**(그래서 어렵게 Qwen을 self-host)이므로, cold 안전망도 고품질 모델을 먼저 시도하는 게 기본값입니다.
+
+단 **trade-off가 있습니다** — 2026-06 측정 시 Seoul on-demand 풀에서 Sonnet 3.5는 **~93% throttle**(`Too many connections`), Haiku 3는 **~43%**(별도 풀, RPM 400 = Sonnet 50의 8배)였습니다. 그래서 Sonnet primary면 cold 요청이 retry backoff로 **16~93초(때때로 timeout)**, Haiku primary면 **4~6초**입니다. **품질을 위해 느린 cold-start를 기본으로 감수**합니다.
+
+cold-start **속도**가 품질보다 중요한 고객은 배포 시 한 줄로 순서를 뒤집을 수 있습니다(소스 수정 불필요):
+
+```bash
+cdk deploy ... -c coldFallbackOrder=availability   # → Haiku 3 primary, Sonnet 3.5 secondary
+# 기본값은 -c coldFallbackOrder=quality (Sonnet primary)
+```
+
+어느 쪽이든 두 모델 모두 Seoul IN_REGION이라 NCT(전 추론 국내)는 보존됩니다. **빠른 속도 + 고품질을 동시에 원하면** 해당 vLLM alias를 `nct-warmup`으로 띄워 self-host 모델(coding=Qwen3.5-27B 등, frontier의 ~82%)로 직접 받는 게 정답입니다 — cold 경로는 어디까지나 "vLLM 기동 동안의 best-effort 안전망"입니다. (Haiku 3 EOL 일정은 Bedrock 콘솔에서 확인하고, 후속 모델로 `config/models.ts`를 갱신하십시오.)
+
+**Q. Claude Code가 "저는 Anthropic의 Claude"라고 답하던데, 그럼 실제로 Claude가 추론한 건가요?**
+**아닙니다 — 모델의 자기소개는 백엔드 판별 신호가 아닙니다.** Claude Code CLI는 추론 모델에게 system prompt로 "너는 Claude Code"라는 정체성을 **주입**하므로, 실제 추론을 Qwen이 했든 Haiku가 했든 모델은 그 주입된 정체성을 그대로 따라 말합니다. "너 누구냐"고 물어도 Qwen이 "저는 Claude입니다"라고 확신에 차서 답합니다(자기가 Qwen인 줄 모름). **실제 백엔드는 응답 헤더(`x-nct-fallback`)와 SmartRouter 로그로만** 판별합니다:
+- 헤더 없음 + `model: qwen35-27b` → vLLM(Qwen)이 답함.
+- `x-nct-fallback: bedrock-direct` + `model: claude-3-haiku...` → cold라서 Bedrock이 답함.
+
+**Q. 라우팅 분류에 LLM이나 임베딩이 쓰이나요?**
+아니요. `detect_scenario()`는 **순수 정규식 키워드 카운트**입니다(`re.findall()`로 math/coding/ocr 단어 빈도를 세어 최다 득점 선택). 임베딩 유사도 검색도, LLM 분류기도 없습니다 — 가볍고 결정적(deterministic)이지만 그만큼 거칩니다(예: "이 함수의 방정식을 풀어줘"는 coding·math 동점). 멀티모달(audio/video)과 초장문(longcontext)만 키워드 이전에 우선 판정됩니다.
 
 ---
 
