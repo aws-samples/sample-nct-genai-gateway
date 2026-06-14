@@ -2,6 +2,24 @@
 
 > 🇰🇷 **한국어**: see [README.md](README.md) (the Korean document is the source of truth).
 
+A company handling **National Core Technology (NCT)** in Korea is legally required to process **all AI inference inside Korea**. The catch: staying compliant leaves you, in practice, with a single high-end option that reaches only **~37% of a frontier model's capability**. This sample lifts that ceiling to **~82%** while keeping your data **100% inside Korea**.
+
+**Without this solution** — you are forced to pick one of three bad options:
+
+- Use **only in-region (Seoul) managed models** to stay compliant → you give up **more than 60% of coding capability**.
+- Use **models in overseas regions** for performance → you take on the **risk of violating NCT**.
+- Run **your own GPUs 24/7** to get both → **cost balloons** beyond what is sustainable.
+
+**With this solution** — researchers keep using the **Claude Code CLI exactly as before** (no retraining). The gateway **automatically routes each request to the best backend inside the Seoul region**. The AI capability you can actually use rises from **~37% to ~82% of frontier**, and your data **never leaves Korea**.
+
+**What you also get**
+
+- **Near-zero cost when idle** — GPUs scale to zero when no one is sending requests (scale-to-zero).
+- **Warm when you need it** — a reservation feature pre-warms models to match working hours.
+- **Seamless fallback** — if a self-hosted model is not up yet, requests fall back to Bedrock (Seoul) so responses never stall.
+
+---
+
 A region-locked LLM Gateway sample that forces **all inference to happen only in the Seoul (`ap-northeast-2`) region**. Researchers keep using the **Claude Code CLI** as-is, while requests are routed internally to either Amazon Bedrock (Claude Sonnet/Haiku) or one of six open-source vLLM models running on Amazon EKS.
 
 > **What is NCT?** NCT (National Core Technology, 국가핵심기술) is a category defined by South Korea's *Act on Prevention of Divulgence and Protection of Industrial Technology*. When such technology is handled on the cloud, the data — and the access rights to it — must not leave the country ([source law, KR](https://www.law.go.kr/법령/산업기술의유출방지및보호에관한법률)). This sample demonstrates an architecture that satisfies those requirements by operating entirely within a single AWS region (Seoul).
