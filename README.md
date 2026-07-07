@@ -3,11 +3,10 @@
 > 🌏 **English**: see [README.en.md](README.en.md). 본 문서(한국어)가 정본입니다.
 
 <p align="center">
-  <video src="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo.mp4"
-         poster="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo-poster.png"
-         controls muted width="720">
-    데모 영상: <a href="docs/media/coding-accuracy-demo.mp4">coding-accuracy-demo.mp4</a>
-  </video>
+  <a href="https://github.com/aws-samples/sample-nct-genai-gateway/blob/main/docs/media/coding-accuracy-demo.mp4">
+    <img src="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo-poster.png" width="720" alt="데모 영상: 코딩 정확도 비교 (약 55초) — 클릭하면 재생">
+  </a>
+  <br><em>▶ 이미지를 클릭하면 데모 영상(약 55초)이 재생됩니다.</em>
 </p>
 
 > **데모 (약 55초)** — 같은 Claude Code 프롬프트를 서울 리전 안의 두 백엔드로 라우팅합니다: cold(Bedrock Sonnet 3.5)와 warm(self-host Qwen3.5-27B on EKS). 쉬운 문제(최대공약수)는 둘 다 정답이지만, 함정이 있는 코딩 문제(`make_a_pile`)에서는 in-region self-host 쪽이 더 정확하게 풉니다. 정량적 배경은 아래 **성능 비교** 섹션(SWE-bench Verified 기준 frontier의 37% → 82%)에서 다룹니다.
