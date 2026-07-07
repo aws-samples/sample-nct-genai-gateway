@@ -2,6 +2,16 @@
 
 > 🌏 **English**: see [README.en.md](README.en.md). 본 문서(한국어)가 정본입니다.
 
+<p align="center">
+  <video src="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo.mp4"
+         poster="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo-poster.png"
+         controls muted width="720">
+    데모 영상: <a href="docs/media/coding-accuracy-demo.mp4">coding-accuracy-demo.mp4</a>
+  </video>
+</p>
+
+> **데모 (약 55초)** — 같은 Claude Code 프롬프트를 서울 리전 안의 두 백엔드로 라우팅합니다: cold(Bedrock Sonnet 3.5)와 warm(self-host Qwen3.5-27B on EKS). 쉬운 문제(최대공약수)는 둘 다 정답이지만, 함정이 있는 코딩 문제(`make_a_pile`)에서는 in-region self-host 쪽이 더 정확하게 풉니다. 정량적 배경은 아래 **성능 비교** 섹션(SWE-bench Verified 기준 frontier의 37% → 82%)에서 다룹니다.
+
 한국에서 **국가핵심기술(NCT)** 을 다루는 회사는 법적으로 "모든 AI 추론을 한국 안에서만" 처리해야 합니다. 문제는, 이 조건을 지키면서 당장 쓸 수 있는 고성능 AI가 사실상 **최신 최고 성능(frontier) 모델의 37% 수준** 하나로 좁혀진다는 점입니다. 이 샘플은 그 한계를 **82% 수준까지** 끌어올리면서도, 데이터는 **100% 한국 안에** 남깁니다.
 
 **이 솔루션이 없으면** — 다음 세 가지 중 하나를 골라야 하는 딜레마에 빠집니다.

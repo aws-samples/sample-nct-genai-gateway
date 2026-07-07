@@ -2,6 +2,16 @@
 
 > 🇰🇷 **한국어**: see [README.md](README.md) (the Korean document is the source of truth).
 
+<p align="center">
+  <video src="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo.mp4"
+         poster="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo-poster.png"
+         controls muted width="720">
+    Demo video: <a href="docs/media/coding-accuracy-demo.mp4">coding-accuracy-demo.mp4</a>
+  </video>
+</p>
+
+> **Demo (~55s)** — the same Claude Code prompt is routed to two backends inside the Seoul region: cold (Bedrock Sonnet 3.5) and warm (self-hosted Qwen3.5-27B on EKS). Both get an easy problem (greatest common divisor) right, but on a trickier coding problem (`make_a_pile`) the in-region self-host is more accurate. The quantitative backdrop is in the **performance comparison** section below (~37% → ~82% of frontier on SWE-bench Verified).
+
 A company handling **National Core Technology (NCT)** in Korea is legally required to process **all AI inference inside Korea**. The catch: staying compliant leaves you, in practice, with a single high-end option that reaches only **~37% of a frontier model's capability**. This sample lifts that ceiling to **~82%** while keeping your data **100% inside Korea**.
 
 **Without this solution** — you are forced to pick one of three bad options:
