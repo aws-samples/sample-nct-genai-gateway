@@ -3,10 +3,9 @@
 > 🇰🇷 **한국어**: see [README.md](README.md) (the Korean document is the source of truth).
 
 <p align="center">
-  <a href="https://github.com/aws-samples/sample-nct-genai-gateway/blob/main/docs/media/coding-accuracy-demo.mp4">
-    <img src="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo-poster.png" width="720" alt="Demo: coding-accuracy comparison (~55s) — click to play">
-  </a>
-  <br><em>▶ Click the image to play the demo video (~55s).</em>
+  <video src="https://github.com/user-attachments/assets/54be5665-c90a-4d7b-b479-dfd7018b6cf7" poster="https://raw.githubusercontent.com/aws-samples/sample-nct-genai-gateway/main/docs/media/coding-accuracy-demo-poster.png" controls muted playsinline width="720">
+    If inline playback is unsupported, watch the <a href="https://github.com/aws-samples/sample-nct-genai-gateway/blob/main/docs/media/coding-accuracy-demo.mp4">demo video (~55s)</a> here.
+  </video>
 </p>
 
 > **Demo (~55s)** — the same Claude Code prompt is routed to two backends inside the Seoul region: cold (Bedrock Sonnet 3.5) and warm (self-hosted Qwen3.5-27B on EKS). Both get an easy problem (greatest common divisor) right, but on a trickier coding problem (`make_a_pile`) the in-region self-host is more accurate. The quantitative backdrop is in the **performance comparison** section below (~37% → ~82% of frontier on SWE-bench Verified).
