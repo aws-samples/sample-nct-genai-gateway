@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/54be5665-c90a-4d7b-b479-dfd7018b6cf7
+
 # NCT GenAI Gateway
 
 > 🌏 **English**: see [README.en.md](README.en.md). 본 문서(한국어)가 정본입니다.
